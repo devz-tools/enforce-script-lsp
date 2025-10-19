@@ -19,7 +19,7 @@ jobs:
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@stable
             - name: Cache Dependencies
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: |
                       ~/.cargo/registry/index/
@@ -29,7 +29,7 @@ jobs:
                   restore-keys: |
                       ${{ runner.os }}-cargo-
             - name: Cache Build Artifacts
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: target/
                   key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
@@ -60,7 +60,7 @@ jobs:
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@stable
             - name: Restore Dependencies
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: |
                       ~/.cargo/registry/index/
@@ -70,7 +70,7 @@ jobs:
                   restore-keys: |
                       ${{ runner.os }}-cargo-
             - name: Restore Build Artifacts
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: target/
                   key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
@@ -92,7 +92,7 @@ jobs:
               with:
                   components: rustfmt
             - name: Restore Dependencies
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: |
                       ~/.cargo/registry/index/
@@ -102,7 +102,7 @@ jobs:
                   restore-keys: |
                       ${{ runner.os }}-cargo-
             - name: Restore Build Artifacts
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: target/
                   key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
@@ -124,7 +124,7 @@ jobs:
               with:
                   components: clippy
             - name: Restore Dependencies
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: |
                       ~/.cargo/registry/index/
@@ -134,7 +134,7 @@ jobs:
                   restore-keys: |
                       ${{ runner.os }}-cargo-
             - name: Restore Build Artifacts
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: target/
                   key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
@@ -154,7 +154,7 @@ jobs:
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@stable
             - name: Restore Dependencies
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: |
                       ~/.cargo/registry/index/
@@ -164,7 +164,7 @@ jobs:
                   restore-keys: |
                       ${{ runner.os }}-cargo-
             - name: Restore Build Artifacts
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: target/
                   key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
