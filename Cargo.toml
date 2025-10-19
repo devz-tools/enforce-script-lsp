@@ -5,8 +5,14 @@ homepage = "https://devz-tools.github.io/"
 repository = "https://github.com/devz-tools/enforce-script-lsp"
 readme = "README.md"
 keywords = ["lsp", "language-server", "enforce-script", "arma", "dayz"]
-categories = ["development-tools", "development-tools::debugging", "api-bindings", "compilers", "parser-implementations"]
-version = "0.1.2"
+categories = [
+    "development-tools",
+    "development-tools::debugging",
+    "api-bindings",
+    "compilers",
+    "parser-implementations",
+]
+version = "0.1.3"
 edition = "2024"
 license = "GPL-3.0"
 
