@@ -910,18 +910,26 @@ int x;
         let tokens = lexer.tokenize();
 
         // Check all expected keywords are present
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Private)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Static)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Protected)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Override)));
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Private))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Static))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Protected))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Override))
+        );
         assert!(
             tokens
                 .iter()
@@ -984,15 +992,21 @@ int x;
         let tokens = lexer.tokenize();
 
         // Check all expected keywords are present
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Switch)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Case)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Default)));
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Switch))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Case))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Default))
+        );
         assert!(
             tokens
                 .iter()
@@ -1097,21 +1111,31 @@ int x;
         let tokens = lexer.tokenize();
 
         // Verify we get all operators and operands
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Plus)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Star)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Minus)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Slash)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::Percent)));
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Plus))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Star))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Minus))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Slash))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::Percent))
+        );
     }
 
     #[test]
@@ -1128,12 +1152,16 @@ int x;
                 .count()
                 >= 2
         );
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::LeftBracket)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::RightBracket)));
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::LeftBracket))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::RightBracket))
+        );
     }
 
     #[test]
@@ -1142,24 +1170,36 @@ int x;
         let mut lexer = Lexer::new(code);
         let tokens = lexer.tokenize();
 
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::BitwiseAnd)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::BitwiseOr)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::BitwiseXor)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::BitwiseNot)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::LeftShift)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::RightShift)));
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::BitwiseAnd))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::BitwiseOr))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::BitwiseXor))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::BitwiseNot))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::LeftShift))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::RightShift))
+        );
     }
 
     #[test]
@@ -1168,30 +1208,46 @@ int x;
         let mut lexer = Lexer::new(code);
         let tokens = lexer.tokenize();
 
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::PlusAssign)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::MinusAssign)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::StarAssign)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::SlashAssign)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::OrAssign)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::AndAssign)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::LeftShiftAssign)));
-        assert!(tokens
-            .iter()
-            .any(|t| matches!(t.token_type, TokenType::RightShiftAssign)));
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::PlusAssign))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::MinusAssign))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::StarAssign))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::SlashAssign))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::OrAssign))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::AndAssign))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::LeftShiftAssign))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.token_type, TokenType::RightShiftAssign))
+        );
     }
 
     #[test]

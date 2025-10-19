@@ -156,26 +156,27 @@ impl Backend {
 
         // Add symbols from symbol table
         if let Some(doc) = self.documents.get(uri)
-            && let Some(ref symbol_table) = doc.symbol_table {
-                for symbol in symbol_table.get_all_symbols() {
-                    let kind = match symbol.kind {
-                        SymbolKind::Class => CompletionItemKind::CLASS,
-                        SymbolKind::Enum => CompletionItemKind::ENUM,
-                        SymbolKind::Function | SymbolKind::Method => CompletionItemKind::FUNCTION,
-                        SymbolKind::Field => CompletionItemKind::FIELD,
-                        SymbolKind::Variable => CompletionItemKind::VARIABLE,
-                        SymbolKind::Parameter => CompletionItemKind::VARIABLE,
-                        SymbolKind::EnumVariant => CompletionItemKind::ENUM_MEMBER,
-                    };
+            && let Some(ref symbol_table) = doc.symbol_table
+        {
+            for symbol in symbol_table.get_all_symbols() {
+                let kind = match symbol.kind {
+                    SymbolKind::Class => CompletionItemKind::CLASS,
+                    SymbolKind::Enum => CompletionItemKind::ENUM,
+                    SymbolKind::Function | SymbolKind::Method => CompletionItemKind::FUNCTION,
+                    SymbolKind::Field => CompletionItemKind::FIELD,
+                    SymbolKind::Variable => CompletionItemKind::VARIABLE,
+                    SymbolKind::Parameter => CompletionItemKind::VARIABLE,
+                    SymbolKind::EnumVariant => CompletionItemKind::ENUM_MEMBER,
+                };
 
-                    items.push(CompletionItem {
-                        label: symbol.name.clone(),
-                        kind: Some(kind),
-                        detail: symbol.type_ref.as_ref().map(|t| format!("{:?}", t)),
-                        ..Default::default()
-                    });
-                }
+                items.push(CompletionItem {
+                    label: symbol.name.clone(),
+                    kind: Some(kind),
+                    detail: symbol.type_ref.as_ref().map(|t| format!("{:?}", t)),
+                    ..Default::default()
+                });
             }
+        }
 
         items
     }
@@ -186,37 +187,38 @@ impl Backend {
             if let Some(symbol_name) = find_symbol_at_position(&doc.text, position) {
                 // Look up symbol in symbol table
                 if let Some(ref symbol_table) = doc.symbol_table
-                    && let Some(symbol) = symbol_table.lookup(&symbol_name) {
-                        let kind_str = match symbol.kind {
-                            crate::semantic::SymbolKind::Class => "class",
-                            crate::semantic::SymbolKind::Enum => "enum",
-                            crate::semantic::SymbolKind::Function => "function",
-                            crate::semantic::SymbolKind::Method => "method",
-                            crate::semantic::SymbolKind::Field => "field",
-                            crate::semantic::SymbolKind::Variable => "variable",
-                            crate::semantic::SymbolKind::Parameter => "parameter",
-                            crate::semantic::SymbolKind::EnumVariant => "enum variant",
-                        };
+                    && let Some(symbol) = symbol_table.lookup(&symbol_name)
+                {
+                    let kind_str = match symbol.kind {
+                        crate::semantic::SymbolKind::Class => "class",
+                        crate::semantic::SymbolKind::Enum => "enum",
+                        crate::semantic::SymbolKind::Function => "function",
+                        crate::semantic::SymbolKind::Method => "method",
+                        crate::semantic::SymbolKind::Field => "field",
+                        crate::semantic::SymbolKind::Variable => "variable",
+                        crate::semantic::SymbolKind::Parameter => "parameter",
+                        crate::semantic::SymbolKind::EnumVariant => "enum variant",
+                    };
 
-                        let type_str = if let Some(ref type_ref) = symbol.type_ref {
-                            format!("{:?}", type_ref)
-                        } else {
-                            "unknown".to_string()
-                        };
+                    let type_str = if let Some(ref type_ref) = symbol.type_ref {
+                        format!("{:?}", type_ref)
+                    } else {
+                        "unknown".to_string()
+                    };
 
-                        let value = format!(
-                            "```enforcescript\n({}) {}: {}\n```",
-                            kind_str, symbol.name, type_str
-                        );
+                    let value = format!(
+                        "```enforcescript\n({}) {}: {}\n```",
+                        kind_str, symbol.name, type_str
+                    );
 
-                        return Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value,
-                            }),
-                            range: Some(span_to_range(&symbol.span)),
-                        });
-                    }
+                    return Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value,
+                        }),
+                        range: Some(span_to_range(&symbol.span)),
+                    });
+                }
             }
         }
         None
@@ -226,60 +228,61 @@ impl Backend {
         let mut symbols = Vec::new();
 
         if let Some(doc) = self.documents.get(uri)
-            && let Some(ref program) = doc.program {
-                for declaration in &program.declarations {
-                    match declaration {
-                        Declaration::Class(class) => {
-                            symbols.push(self.class_to_document_symbol(class));
-                        }
-                        Declaration::Enum(enum_decl) => {
-                            #[allow(deprecated)]
-                            symbols.push(DocumentSymbol {
-                                name: enum_decl.name.clone(),
-                                detail: None,
-                                kind: tower_lsp::lsp_types::SymbolKind::ENUM,
-                                tags: None,
-                                deprecated: None,
-                                range: span_to_range(&enum_decl.span),
-                                selection_range: span_to_range(&enum_decl.span),
-                                children: Some(
-                                    enum_decl
-                                        .variants
-                                        .iter()
-                                        .map(|v| {
-                                            #[allow(deprecated)]
-                                            DocumentSymbol {
-                                                name: v.name.clone(),
-                                                detail: v.value.map(|val| val.to_string()),
-                                                kind: tower_lsp::lsp_types::SymbolKind::ENUM_MEMBER,
-                                                tags: None,
-                                                deprecated: None,
-                                                range: span_to_range(&v.span),
-                                                selection_range: span_to_range(&v.span),
-                                                children: None,
-                                            }
-                                        })
-                                        .collect(),
-                                ),
-                            });
-                        }
-                        Declaration::Function(function) => {
-                            #[allow(deprecated)]
-                            symbols.push(DocumentSymbol {
-                                name: function.name.clone(),
-                                detail: Some(format!("{:?}", function.return_type)),
-                                kind: tower_lsp::lsp_types::SymbolKind::FUNCTION,
-                                tags: None,
-                                deprecated: None,
-                                range: span_to_range(&function.span),
-                                selection_range: span_to_range(&function.span),
-                                children: None,
-                            });
-                        }
-                        _ => {}
+            && let Some(ref program) = doc.program
+        {
+            for declaration in &program.declarations {
+                match declaration {
+                    Declaration::Class(class) => {
+                        symbols.push(self.class_to_document_symbol(class));
                     }
+                    Declaration::Enum(enum_decl) => {
+                        #[allow(deprecated)]
+                        symbols.push(DocumentSymbol {
+                            name: enum_decl.name.clone(),
+                            detail: None,
+                            kind: tower_lsp::lsp_types::SymbolKind::ENUM,
+                            tags: None,
+                            deprecated: None,
+                            range: span_to_range(&enum_decl.span),
+                            selection_range: span_to_range(&enum_decl.span),
+                            children: Some(
+                                enum_decl
+                                    .variants
+                                    .iter()
+                                    .map(|v| {
+                                        #[allow(deprecated)]
+                                        DocumentSymbol {
+                                            name: v.name.clone(),
+                                            detail: v.value.map(|val| val.to_string()),
+                                            kind: tower_lsp::lsp_types::SymbolKind::ENUM_MEMBER,
+                                            tags: None,
+                                            deprecated: None,
+                                            range: span_to_range(&v.span),
+                                            selection_range: span_to_range(&v.span),
+                                            children: None,
+                                        }
+                                    })
+                                    .collect(),
+                            ),
+                        });
+                    }
+                    Declaration::Function(function) => {
+                        #[allow(deprecated)]
+                        symbols.push(DocumentSymbol {
+                            name: function.name.clone(),
+                            detail: Some(format!("{:?}", function.return_type)),
+                            kind: tower_lsp::lsp_types::SymbolKind::FUNCTION,
+                            tags: None,
+                            deprecated: None,
+                            range: span_to_range(&function.span),
+                            selection_range: span_to_range(&function.span),
+                            children: None,
+                        });
+                    }
+                    _ => {}
                 }
             }
+        }
 
         symbols
     }
@@ -517,29 +520,29 @@ impl LanguageServer for Backend {
             // Find symbol name at position (would need better parsing to find function being called)
             if let Some(symbol_name) = find_symbol_at_position(&doc.text, position)
                 && let Some(ref symbol_table) = doc.symbol_table
-                    && let Some(symbol) = symbol_table.lookup(&symbol_name) {
-                        // Only provide signature help for functions and methods
-                        if matches!(
-                            symbol.kind,
-                            crate::semantic::SymbolKind::Function
-                                | crate::semantic::SymbolKind::Method
-                        ) {
-                            // For now, provide basic signature info
-                            // A full implementation would parse parameters from the symbol
-                            let signature = SignatureInformation {
-                                label: format!("{}()", symbol.name),
-                                documentation: None,
-                                parameters: None,
-                                active_parameter: None,
-                            };
+                && let Some(symbol) = symbol_table.lookup(&symbol_name)
+            {
+                // Only provide signature help for functions and methods
+                if matches!(
+                    symbol.kind,
+                    crate::semantic::SymbolKind::Function | crate::semantic::SymbolKind::Method
+                ) {
+                    // For now, provide basic signature info
+                    // A full implementation would parse parameters from the symbol
+                    let signature = SignatureInformation {
+                        label: format!("{}()", symbol.name),
+                        documentation: None,
+                        parameters: None,
+                        active_parameter: None,
+                    };
 
-                            return Ok(Some(SignatureHelp {
-                                signatures: vec![signature],
-                                active_signature: Some(0),
-                                active_parameter: None,
-                            }));
-                        }
-                    }
+                    return Ok(Some(SignatureHelp {
+                        signatures: vec![signature],
+                        active_signature: Some(0),
+                        active_parameter: None,
+                    }));
+                }
+            }
         }
 
         Ok(None)
@@ -558,13 +561,14 @@ impl LanguageServer for Backend {
             if let Some(symbol_name) = find_symbol_at_position(&doc.text, position) {
                 // Look up symbol in symbol table
                 if let Some(ref symbol_table) = doc.symbol_table
-                    && let Some(symbol) = symbol_table.lookup(&symbol_name) {
-                        let location = Location {
-                            uri,
-                            range: span_to_range(&symbol.span),
-                        };
-                        return Ok(Some(GotoDefinitionResponse::Scalar(location)));
-                    }
+                    && let Some(symbol) = symbol_table.lookup(&symbol_name)
+                {
+                    let location = Location {
+                        uri,
+                        range: span_to_range(&symbol.span),
+                    };
+                    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                }
             }
         }
 
@@ -654,20 +658,21 @@ impl LanguageServer for Backend {
         let mut ranges = Vec::new();
 
         if let Some(doc) = self.documents.get(&uri)
-            && let Some(ref program) = doc.program {
-                for declaration in &program.declarations {
-                    if let Declaration::Class(class) = declaration {
-                        ranges.push(FoldingRange {
-                            start_line: (class.span.start.line - 1) as u32,
-                            start_character: Some((class.span.start.column - 1) as u32),
-                            end_line: (class.span.end.line - 1) as u32,
-                            end_character: Some((class.span.end.column - 1) as u32),
-                            kind: Some(FoldingRangeKind::Region),
-                            collapsed_text: None,
-                        });
-                    }
+            && let Some(ref program) = doc.program
+        {
+            for declaration in &program.declarations {
+                if let Declaration::Class(class) = declaration {
+                    ranges.push(FoldingRange {
+                        start_line: (class.span.start.line - 1) as u32,
+                        start_character: Some((class.span.start.column - 1) as u32),
+                        end_line: (class.span.end.line - 1) as u32,
+                        end_character: Some((class.span.end.column - 1) as u32),
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: None,
+                    });
                 }
             }
+        }
 
         Ok(Some(ranges))
     }

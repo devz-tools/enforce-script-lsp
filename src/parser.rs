@@ -499,28 +499,28 @@ impl Parser {
         // Check if this looks like a config.cpp style field (identifier followed by [ or =)
         // e.g., fieldName[]=value; or fieldName=value;
         if let Some(token) = self.current_opt()
-            && let TokenType::Identifier(first_name) = &token.token_type {
-                let first_name_clone = first_name.clone();
-                self.advance();
+            && let TokenType::Identifier(first_name) = &token.token_type
+        {
+            let first_name_clone = first_name.clone();
+            self.advance();
 
-                // Check what comes after the identifier
-                if self.check(&TokenType::LeftBracket) || self.check(&TokenType::Assign) {
-                    // This is a config-style field without explicit type
-                    // Treat the identifier as the field name with Auto type
-                    let is_array_field = self.match_token(&[TokenType::LeftBracket]);
-                    if is_array_field {
-                        self.consume(&TokenType::RightBracket, "Expected ']' after '['")?;
-                    }
-                    let field =
-                        self.parse_field_rest(modifiers, TypeRef::Auto, first_name_clone)?;
-                    return Ok((vec![], vec![field]));
+            // Check what comes after the identifier
+            if self.check(&TokenType::LeftBracket) || self.check(&TokenType::Assign) {
+                // This is a config-style field without explicit type
+                // Treat the identifier as the field name with Auto type
+                let is_array_field = self.match_token(&[TokenType::LeftBracket]);
+                if is_array_field {
+                    self.consume(&TokenType::RightBracket, "Expected ']' after '['")?;
                 }
-
-                // Not a config-style field, so the first identifier was a type
-                // We need to parse it as a type and then get the actual member name
-                // Rewind one step to re-parse as type
-                self.position -= 1;
+                let field = self.parse_field_rest(modifiers, TypeRef::Auto, first_name_clone)?;
+                return Ok((vec![], vec![field]));
             }
+
+            // Not a config-style field, so the first identifier was a type
+            // We need to parse it as a type and then get the actual member name
+            // Rewind one step to re-parse as type
+            self.position -= 1;
+        }
 
         // Standard Enforce Script: type name = value; or type name(...) { }
         let type_ref = self.parse_type()?;
@@ -1700,11 +1700,12 @@ impl Parser {
 
     fn consume_identifier(&mut self, message: &str) -> Result<String, String> {
         if let Some(token) = self.current_opt()
-            && let TokenType::Identifier(name) = &token.token_type {
-                let result = name.clone();
-                self.advance();
-                return Ok(result);
-            }
+            && let TokenType::Identifier(name) = &token.token_type
+        {
+            let result = name.clone();
+            self.advance();
+            return Ok(result);
+        }
         Err(format!("{} at line {}", message, self.current().line))
     }
 
@@ -1713,9 +1714,10 @@ impl Parser {
 
         while !self.is_at_end() {
             if let Some(prev) = self.previous()
-                && matches!(prev.token_type, TokenType::Semicolon) {
-                    return;
-                }
+                && matches!(prev.token_type, TokenType::Semicolon)
+            {
+                return;
+            }
 
             if let Some(curr) = self.current_opt()
                 && matches!(
@@ -1732,9 +1734,10 @@ impl Parser {
                         | TokenType::If
                         | TokenType::While
                         | TokenType::Return
-                ) {
-                    return;
-                }
+                )
+            {
+                return;
+            }
 
             self.advance();
         }
