@@ -17,18 +17,12 @@ on:
         required: false
         type: boolean
         default: false
-      skip_ci_check:
-        description: "Skip CI validation (not recommended)"
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   # Verify CI has passed before proceeding (lightweight check, no polling)
   check-ci:
     name: Verify CI Passed
     runs-on: ubuntu-latest
-    if: ${{ !inputs.skip_ci_check }}
     steps:
       - uses: actions/checkout@v5
 
