@@ -78,6 +78,10 @@ pub enum Expression {
     NullLiteral(Span),
     VectorLiteral(String, Span),
     Identifier(String, Span),
+    ArrayLiteral {
+        elements: Vec<Expression>,
+        span: Span,
+    },
     Binary {
         left: Box<Expression>,
         operator: String,
@@ -134,6 +138,7 @@ impl Expression {
             Expression::NullLiteral(span) => span,
             Expression::VectorLiteral(_, span) => span,
             Expression::Identifier(_, span) => span,
+            Expression::ArrayLiteral { span, .. } => span,
             Expression::Binary { span, .. } => span,
             Expression::Unary { span, .. } => span,
             Expression::Call { span, .. } => span,
@@ -300,14 +305,18 @@ pub struct Program {
 pub struct Parser {
     tokens: Vec<Token>,
     position: usize,
+    errors: Vec<String>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser {
+        let mut parser = Parser {
             tokens,
             position: 0,
-        }
+            errors: Vec::new(),
+        };
+        parser.skip_comments();
+        parser
     }
 
     pub fn parse(&mut self) -> Result<Program, String> {
@@ -319,12 +328,17 @@ impl Parser {
                 Err(e) => {
                     // Error recovery: skip to next likely declaration start
                     eprintln!("Parse error: {}", e);
+                    self.errors.push(e);
                     self.synchronize();
                 }
             }
         }
 
         Ok(Program { declarations })
+    }
+
+    pub fn get_errors(&self) -> &[String] {
+        &self.errors
     }
 
     fn parse_declaration(&mut self) -> Result<Declaration, String> {
@@ -381,6 +395,22 @@ impl Parser {
                 None
             };
 
+        // Check for forward declaration (class Name;)
+        if self.match_token(&[TokenType::Semicolon]) {
+            let end = Position::from_token(self.previous().unwrap());
+            let span = Span::new(start, end);
+            // Return empty class for forward declaration
+            return Ok(Declaration::Class(Class {
+                modifiers,
+                name,
+                extends,
+                template_params,
+                methods: Vec::new(),
+                fields: Vec::new(),
+                span,
+            }));
+        }
+
         self.consume(&TokenType::LeftBrace, "Expected '{'")?;
 
         let mut methods = Vec::new();
@@ -394,6 +424,7 @@ impl Parser {
                 }
                 Err(e) => {
                     eprintln!("Error parsing class member: {}", e);
+                    self.errors.push(e);
                     self.synchronize();
                 }
             }
@@ -403,6 +434,9 @@ impl Parser {
         let end_column = self.current().column;
         let end_offset = self.current().offset;
         self.consume(&TokenType::RightBrace, "Expected '}'")?;
+
+        // Optional semicolon after class closing brace (config.cpp style)
+        self.match_token(&[TokenType::Semicolon]);
 
         let end = Position::new(end_line, end_column, end_offset);
         let span = Span::new(start, end);
@@ -454,15 +488,57 @@ impl Parser {
             }
         }
 
-        // Try to parse as method or field
+        // Check for nested class declaration
+        if self.check(&TokenType::Class) {
+            let _class_decl = self.parse_class(modifiers)?;
+            // For now, we ignore nested classes (config.cpp pattern)
+            // They'll be stored as declarations but not as class members
+            return Ok((vec![], vec![]));
+        }
+
+        // Check if this looks like a config.cpp style field (identifier followed by [ or =)
+        // e.g., fieldName[]=value; or fieldName=value;
+        if let Some(token) = self.current_opt() {
+            if let TokenType::Identifier(first_name) = &token.token_type {
+                let first_name_clone = first_name.clone();
+                self.advance();
+
+                // Check what comes after the identifier
+                if self.check(&TokenType::LeftBracket) || self.check(&TokenType::Assign) {
+                    // This is a config-style field without explicit type
+                    // Treat the identifier as the field name with Auto type
+                    let is_array_field = self.match_token(&[TokenType::LeftBracket]);
+                    if is_array_field {
+                        self.consume(&TokenType::RightBracket, "Expected ']' after '['")?;
+                    }
+                    let field =
+                        self.parse_field_rest(modifiers, TypeRef::Auto, first_name_clone)?;
+                    return Ok((vec![], vec![field]));
+                }
+
+                // Not a config-style field, so the first identifier was a type
+                // We need to parse it as a type and then get the actual member name
+                // Rewind one step to re-parse as type
+                self.position -= 1;
+            }
+        }
+
+        // Standard Enforce Script: type name = value; or type name(...) { }
         let type_ref = self.parse_type()?;
         let name = self.consume_identifier("Expected member name")?;
+
+        // Check for array brackets (e.g., int myArray[10];)
+        let is_array_field = self.match_token(&[TokenType::LeftBracket]);
+        if is_array_field {
+            self.consume(&TokenType::RightBracket, "Expected ']' after '['")?;
+        }
 
         // Check if it's a method (has parentheses)
         if self.check(&TokenType::LeftParen) {
             let method = self.parse_method_rest(modifiers, type_ref, name)?;
             Ok((vec![method], vec![]))
         } else {
+            // It's a field
             let field = self.parse_field_rest(modifiers, type_ref, name)?;
             Ok((vec![], vec![field]))
         }
@@ -762,6 +838,7 @@ impl Parser {
                 Ok(stmt) => statements.push(stmt),
                 Err(e) => {
                     eprintln!("Error parsing statement: {}", e);
+                    self.errors.push(e);
                     self.synchronize();
                 }
             }
@@ -1519,6 +1596,29 @@ impl Parser {
             return Ok(expr);
         }
 
+        // Array/object initializer (config.cpp style): {value1, value2, ...}
+        if self.match_token(&[TokenType::LeftBrace]) {
+            let start = Position::from_token(self.previous().unwrap());
+            let mut elements = Vec::new();
+
+            while !self.check(&TokenType::RightBrace) && !self.is_at_end() {
+                elements.push(self.parse_expression()?);
+                if !self.match_token(&[TokenType::Comma]) {
+                    break;
+                }
+            }
+
+            let end_line = self.current().line;
+            let end_column = self.current().column;
+            let end_offset = self.current().offset;
+            self.consume(&TokenType::RightBrace, "Expected '}'")?;
+
+            let end = Position::new(end_line, end_column, end_offset);
+            let span = Span::new(start, end);
+
+            return Ok(Expression::ArrayLiteral { elements, span });
+        }
+
         Err(format!("Unexpected token: {:?}", self.current_opt()))
     }
 
@@ -1554,6 +1654,21 @@ impl Parser {
     fn advance(&mut self) {
         if !self.is_at_end() {
             self.position += 1;
+            self.skip_comments();
+        }
+    }
+
+    fn skip_comments(&mut self) {
+        while !self.is_at_end() {
+            if let Some(token) = self.current_opt() {
+                if matches!(token.token_type, TokenType::Comment(_)) {
+                    self.position += 1;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
     }
 
@@ -2379,5 +2494,94 @@ class TestConst
         let result = parser.parse();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_with_comments() {
+        let code = r#"
+// This is a file comment
+modded class StaminaHandler
+{
+    // This function is called every frame to update the stamina state.
+    // By overriding it with an empty function, we prevent any stamina
+    // calculations from happening.
+    override void Update(float deltaT, int pCurrentCommandID)
+    {
+        // Stamina update logic is intentionally left blank.
+        // This stops stamina from draining or regenerating based on player actions.
+        // The stamina bar will appear full at all times.
+    }
+
+    /* This function is called when an action should deplete stamina.
+       We override it to do nothing. */
+    override void DepleteStamina(EStaminaModifiers modifier, float dT = -1)
+    {
+        // Stamina depletion logic is intentionally left blank.
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        if let Err(e) = &result {
+            eprintln!("Parse error: {}", e);
+        }
+        for error in parser.get_errors() {
+            eprintln!("Parser error: {}", error);
+        }
+
+        assert!(result.is_ok());
+        assert_eq!(
+            parser.get_errors().len(),
+            0,
+            "Parser should not have any errors"
+        );
+    }
+
+    #[test]
+    fn test_parse_config_cpp_style() {
+        let code = r#"
+class CfgPatches
+{
+    class MyMod
+    {
+        requiredAddons[]={"DZ_Characters_Vests"};
+    };
+};
+
+class CfgVehicles
+{
+    class Clothing;
+    class SmershVest: Clothing
+    {
+        inventorySlot[]=
+        {
+            "Vest",
+            "Hips"
+        };
+        itemSize[]={2,2};
+    };
+};
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        if let Err(e) = &result {
+            eprintln!("Parse error: {}", e);
+        }
+        for error in parser.get_errors() {
+            eprintln!("Parser error: {}", error);
+        }
+
+        assert!(result.is_ok());
+        assert_eq!(
+            parser.get_errors().len(),
+            0,
+            "Config.cpp style should parse without errors"
+        );
     }
 }

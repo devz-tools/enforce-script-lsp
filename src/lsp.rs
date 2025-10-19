@@ -38,10 +38,20 @@ impl Backend {
 
         let mut parser = Parser::new(tokens);
         let program = match parser.parse() {
-            Ok(prog) => Some(prog),
+            Ok(prog) => {
+                // Collect parser errors even when parse succeeds (due to error recovery)
+                for error in parser.get_errors() {
+                    diagnostics.push(create_diagnostic(error.clone(), DiagnosticSeverity::ERROR));
+                }
+                Some(prog)
+            }
             Err(e) => {
                 let message = format!("Parse error: {}", e);
                 diagnostics.push(create_diagnostic(message, DiagnosticSeverity::ERROR));
+                // Also collect any accumulated errors
+                for error in parser.get_errors() {
+                    diagnostics.push(create_diagnostic(error.clone(), DiagnosticSeverity::ERROR));
+                }
                 None
             }
         };
