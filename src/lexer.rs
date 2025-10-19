@@ -343,7 +343,7 @@ impl Lexer {
         // Handle decimal point
         if !self.is_at_end()
             && self.current_char() == '.'
-            && self.peek(1).map_or(false, |c| c.is_ascii_digit())
+            && self.peek(1).is_some_and(|c| c.is_ascii_digit())
         {
             is_float = true;
             self.advance(); // '.'
@@ -763,8 +763,8 @@ class MyClass
         let tokens = lexer.tokenize();
 
         assert_eq!(tokens.len(), 5); // 4 strings + EOF
-        for i in 0..4 {
-            assert!(matches!(tokens[i].token_type, TokenType::StringLiteral(_)));
+        for token in tokens.iter().take(4) {
+            assert!(matches!(token.token_type, TokenType::StringLiteral(_)));
         }
     }
 

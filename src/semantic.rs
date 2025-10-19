@@ -75,10 +75,7 @@ impl SymbolTable {
         self.scopes[self.current_scope].insert(name.clone(), symbol.clone());
 
         // Add to global symbols list for cross-scope lookup
-        self.symbols
-            .entry(name)
-            .or_insert_with(Vec::new)
-            .push(symbol);
+        self.symbols.entry(name).or_default().push(symbol);
 
         Ok(())
     }

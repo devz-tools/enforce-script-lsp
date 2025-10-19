@@ -662,18 +662,15 @@ impl LanguageServer for Backend {
         if let Some(doc) = self.documents.get(&uri) {
             if let Some(ref program) = doc.program {
                 for declaration in &program.declarations {
-                    match declaration {
-                        Declaration::Class(class) => {
-                            ranges.push(FoldingRange {
-                                start_line: (class.span.start.line - 1) as u32,
-                                start_character: Some((class.span.start.column - 1) as u32),
-                                end_line: (class.span.end.line - 1) as u32,
-                                end_character: Some((class.span.end.column - 1) as u32),
-                                kind: Some(FoldingRangeKind::Region),
-                                collapsed_text: None,
-                            });
-                        }
-                        _ => {}
+                    if let Declaration::Class(class) = declaration {
+                        ranges.push(FoldingRange {
+                            start_line: (class.span.start.line - 1) as u32,
+                            start_character: Some((class.span.start.column - 1) as u32),
+                            end_line: (class.span.end.line - 1) as u32,
+                            end_character: Some((class.span.end.column - 1) as u32),
+                            kind: Some(FoldingRangeKind::Region),
+                            collapsed_text: None,
+                        });
                     }
                 }
             }
@@ -692,6 +689,6 @@ pub async fn start_server() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| Backend::new(client));
+    let (service, socket) = LspService::new(Backend::new);
     Server::new(stdin, stdout, socket).serve(service).await;
 }

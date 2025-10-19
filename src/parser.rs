@@ -294,7 +294,7 @@ pub enum Declaration {
     Class(Class),
     Enum(Enum),
     Typedef(Typedef),
-    Function(Method), // Global functions
+    Function(Box<Method>), // Global functions
 }
 
 #[derive(Debug, Clone)]
@@ -702,7 +702,7 @@ impl Parser {
         let name = self.consume_identifier("Expected function name")?;
 
         let method = self.parse_method_rest(modifiers, return_type, name)?;
-        Ok(Declaration::Function(method))
+        Ok(Declaration::Function(Box::new(method)))
     }
 
     fn parse_parameters(&mut self) -> Result<Vec<Parameter>, String> {
