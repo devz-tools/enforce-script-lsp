@@ -113,6 +113,14 @@ jobs:
             os: windows-latest
             target: aarch64-pc-windows-msvc
             artifact: enforce-script-lsp-${{ inputs.version }}-windows-arm64.exe
+          - name: FreeBSD x64
+            os: ubuntu-latest
+            target: x86_64-unknown-freebsd
+            artifact: enforce-script-lsp-${{ inputs.version }}-freebsd-x64
+          - name: FreeBSD ARM64
+            os: ubuntu-latest
+            target: aarch64-unknown-freebsd
+            artifact: enforce-script-lsp-${{ inputs.version }}-freebsd-arm64
     steps:
       - uses: actions/checkout@v5
 
@@ -138,10 +146,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Install cross-compilation tools (FreeBSD)
+        if: matrix.platform.target == 'x86_64-unknown-freebsd' || matrix.platform.target == 'aarch64-unknown-freebsd'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
       - name: Build Release Binary
         run: cargo build --release --target ${{ matrix.platform.target }} --verbose
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER: clang
+          CARGO_TARGET_AARCH64_UNKNOWN_FREEBSD_LINKER: clang
 
       - name: Prepare Binary (Unix)
         if: runner.os != 'Windows'
@@ -211,3 +227,5 @@ jobs:
             artifacts/enforce-script-lsp-${{ inputs.version }}-macos-arm64/enforce-script-lsp-${{ inputs.version }}-macos-arm64
             artifacts/enforce-script-lsp-${{ inputs.version }}-windows-x64.exe/enforce-script-lsp-${{ inputs.version }}-windows-x64.exe
             artifacts/enforce-script-lsp-${{ inputs.version }}-windows-arm64.exe/enforce-script-lsp-${{ inputs.version }}-windows-arm64.exe
+            artifacts/enforce-script-lsp-${{ inputs.version }}-freebsd-x64/enforce-script-lsp-${{ inputs.version }}-freebsd-x64
+            artifacts/enforce-script-lsp-${{ inputs.version }}-freebsd-arm64/enforce-script-lsp-${{ inputs.version }}-freebsd-arm64
