@@ -36,6 +36,15 @@ jobs:
                   restore-keys: |
                       ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
                       ${{ runner.os }}-target-
+            - name: Restore timestamps
+              run: |
+                  # Use git to restore original file timestamps
+                  # This prevents Cargo from seeing files as "changed" after cache restore
+                  git ls-tree -r --name-only HEAD | while read filename; do
+                    if [ -f "$filename" ]; then
+                      touch -d "$(git log -1 --format=%ci -- "$filename")" "$filename"
+                    fi
+                  done
             - name: Build Project
               run: cargo build --verbose
             - name: Build Tests
@@ -68,6 +77,8 @@ jobs:
                   restore-keys: |
                       ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
                       ${{ runner.os }}-target-
+            - name: Run Tests
+              run: cargo test --verbose
 
     # Check code formatting
     format:
