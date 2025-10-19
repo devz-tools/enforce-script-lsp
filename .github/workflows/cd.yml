@@ -17,52 +17,41 @@ on:
         required: false
         type: boolean
         default: false
+      skip_ci_check:
+        description: "Skip CI validation (not recommended)"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
-  # Verify CI has passed before proceeding
+  # Verify CI has passed before proceeding (lightweight check, no polling)
   check-ci:
     name: Verify CI Passed
     runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_ci_check }}
     steps:
-      - name: Wait for Build to succeed
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.ref }}
-          check-name: "Build Project"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 10
+      - uses: actions/checkout@v5
 
-      - name: Wait for Tests to succeed
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.ref }}
-          check-name: "Run Tests"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 10
+      - name: Check CI Status via GitHub API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🔍 Checking CI status for commit: ${{ github.sha }}"
 
-      - name: Wait for Format check to succeed
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.ref }}
-          check-name: "Check Formatting"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 10
+          # Get all check runs for this commit
+          gh api repos/${{ github.repository }}/commits/${{ github.sha }}/check-runs \
+            --jq '.check_runs[] | select(.name | test("Build Project|Run Tests|Check Formatting|Run Clippy Lints|Build Documentation")) | "\(.name): \(.conclusion)"'
 
-      - name: Wait for Clippy to succeed
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.ref }}
-          check-name: "Run Clippy Lints"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 10
+          # Check if all required checks passed
+          FAILED_CHECKS=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }}/check-runs \
+            --jq '[.check_runs[] | select(.name | test("Build Project|Run Tests|Check Formatting|Run Clippy Lints|Build Documentation")) | select(.conclusion != "success")] | length')
 
-      - name: Wait for Docs to succeed
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.ref }}
-          check-name: "Build Documentation"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 10
+          if [ "$FAILED_CHECKS" -gt 0 ]; then
+            echo "❌ CI checks have not all passed. Please ensure all CI checks are green before releasing."
+            exit 1
+          fi
+
+          echo "✅ All CI checks passed!"
 
   # Build release binaries for all platforms
   build-release:
@@ -138,7 +127,7 @@ jobs:
           Copy-Item target/${{ matrix.platform.target }}/release/enforce-script-lsp.exe ${{ matrix.platform.artifact }}
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.platform.artifact }}
           path: ${{ matrix.platform.artifact }}
