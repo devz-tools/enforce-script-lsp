@@ -12,7 +12,7 @@ on:
 jobs:
     # Ensure compilation with no warnings or errors
     build:
-        name: Build Project and Tests
+        name: Build Project
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v5
@@ -27,28 +27,17 @@ jobs:
                       ~/.cargo/git/db/
                   key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: |
-                      ${{ runner.os }}-cargo-
+                    ${{ runner.os }}-cargo-
             - name: Cache Build Artifacts
               uses: actions/cache@v4
               with:
                   path: target/
                   key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
                   restore-keys: |
-                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
-                      ${{ runner.os }}-target-
-            - name: Restore timestamps
-              run: |
-                  # Use git to restore original file timestamps
-                  # This prevents Cargo from seeing files as "changed" after cache restore
-                  git ls-tree -r --name-only HEAD | while read filename; do
-                    if [ -f "$filename" ]; then
-                      touch -d "$(git log -1 --format=%ci -- "$filename")" "$filename"
-                    fi
-                  done
+                    ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+                    ${{ runner.os }}-target-
             - name: Build Project
               run: cargo build --verbose
-            - name: Build Tests
-              run: cargo test --no-run --verbose
 
     # Run all tests
     test:
@@ -75,8 +64,8 @@ jobs:
                   path: target/
                   key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
                   restore-keys: |
-                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
-                      ${{ runner.os }}-target-
+                    ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+                    ${{ runner.os }}-target-
             - name: Run Tests
               run: cargo test --verbose
 
