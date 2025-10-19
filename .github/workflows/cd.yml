@@ -19,9 +19,43 @@ on:
         default: false
 
 jobs:
+  # Verify version matches Cargo.toml
+  validate-version:
+    name: Validate Version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check version matches Cargo.toml
+        run: |
+          echo "🔍 Validating version input..."
+
+          # Remove 'v' prefix from input version if present
+          INPUT_VERSION="${{ inputs.version }}"
+          INPUT_VERSION="${INPUT_VERSION#v}"
+
+          # Extract version from Cargo.toml
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+
+          echo "📋 Input version: $INPUT_VERSION"
+          echo "📦 Cargo.toml version: $CARGO_VERSION"
+
+          if [ "$INPUT_VERSION" != "$CARGO_VERSION" ]; then
+            echo "❌ Version mismatch!"
+            echo "   Input version: $INPUT_VERSION"
+            echo "   Cargo.toml version: $CARGO_VERSION"
+            echo ""
+            echo "Please ensure the version you entered matches the version in Cargo.toml"
+            echo "Either update Cargo.toml to version $INPUT_VERSION and commit, or use version $CARGO_VERSION"
+            exit 1
+          fi
+
+          echo "✅ Version matches Cargo.toml!"
+
   # Verify CI has passed before proceeding (lightweight check, no polling)
   check-ci:
     name: Verify CI Passed
+    needs: validate-version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -127,11 +161,30 @@ jobs:
           path: ${{ matrix.platform.artifact }}
           retention-days: 1
 
+  # Publish to crates.io
+  publish-crates:
+    name: Publish to crates.io
+    needs: check-ci
+    if: ${{ !inputs.dry_run && !inputs.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          echo "📦 Publishing to crates.io..."
+          cargo publish --verbose
+
   # Create GitHub Release with all binaries
   create-release:
     name: Create GitHub Release
     needs: build-release
-    if: ${{ !inputs.dry_run }}
+    if: ${{ !inputs.dry_run && always() && needs.build-release.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

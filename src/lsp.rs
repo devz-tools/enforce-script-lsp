@@ -155,8 +155,8 @@ impl Backend {
         }
 
         // Add symbols from symbol table
-        if let Some(doc) = self.documents.get(uri) {
-            if let Some(ref symbol_table) = doc.symbol_table {
+        if let Some(doc) = self.documents.get(uri)
+            && let Some(ref symbol_table) = doc.symbol_table {
                 for symbol in symbol_table.get_all_symbols() {
                     let kind = match symbol.kind {
                         SymbolKind::Class => CompletionItemKind::CLASS,
@@ -176,7 +176,6 @@ impl Backend {
                     });
                 }
             }
-        }
 
         items
     }
@@ -186,8 +185,8 @@ impl Backend {
             // Find symbol name at position
             if let Some(symbol_name) = find_symbol_at_position(&doc.text, position) {
                 // Look up symbol in symbol table
-                if let Some(ref symbol_table) = doc.symbol_table {
-                    if let Some(symbol) = symbol_table.lookup(&symbol_name) {
+                if let Some(ref symbol_table) = doc.symbol_table
+                    && let Some(symbol) = symbol_table.lookup(&symbol_name) {
                         let kind_str = match symbol.kind {
                             crate::semantic::SymbolKind::Class => "class",
                             crate::semantic::SymbolKind::Enum => "enum",
@@ -218,7 +217,6 @@ impl Backend {
                             range: Some(span_to_range(&symbol.span)),
                         });
                     }
-                }
             }
         }
         None
@@ -227,8 +225,8 @@ impl Backend {
     fn get_document_symbols(&self, uri: &str) -> Vec<DocumentSymbol> {
         let mut symbols = Vec::new();
 
-        if let Some(doc) = self.documents.get(uri) {
-            if let Some(ref program) = doc.program {
+        if let Some(doc) = self.documents.get(uri)
+            && let Some(ref program) = doc.program {
                 for declaration in &program.declarations {
                     match declaration {
                         Declaration::Class(class) => {
@@ -282,7 +280,6 @@ impl Backend {
                     }
                 }
             }
-        }
 
         symbols
     }
@@ -518,9 +515,9 @@ impl LanguageServer for Backend {
 
         if let Some(doc) = self.documents.get(&uri) {
             // Find symbol name at position (would need better parsing to find function being called)
-            if let Some(symbol_name) = find_symbol_at_position(&doc.text, position) {
-                if let Some(ref symbol_table) = doc.symbol_table {
-                    if let Some(symbol) = symbol_table.lookup(&symbol_name) {
+            if let Some(symbol_name) = find_symbol_at_position(&doc.text, position)
+                && let Some(ref symbol_table) = doc.symbol_table
+                    && let Some(symbol) = symbol_table.lookup(&symbol_name) {
                         // Only provide signature help for functions and methods
                         if matches!(
                             symbol.kind,
@@ -543,8 +540,6 @@ impl LanguageServer for Backend {
                             }));
                         }
                     }
-                }
-            }
         }
 
         Ok(None)
@@ -562,15 +557,14 @@ impl LanguageServer for Backend {
             // Find symbol name at position
             if let Some(symbol_name) = find_symbol_at_position(&doc.text, position) {
                 // Look up symbol in symbol table
-                if let Some(ref symbol_table) = doc.symbol_table {
-                    if let Some(symbol) = symbol_table.lookup(&symbol_name) {
+                if let Some(ref symbol_table) = doc.symbol_table
+                    && let Some(symbol) = symbol_table.lookup(&symbol_name) {
                         let location = Location {
                             uri,
                             range: span_to_range(&symbol.span),
                         };
                         return Ok(Some(GotoDefinitionResponse::Scalar(location)));
                     }
-                }
             }
         }
 
@@ -659,8 +653,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         let mut ranges = Vec::new();
 
-        if let Some(doc) = self.documents.get(&uri) {
-            if let Some(ref program) = doc.program {
+        if let Some(doc) = self.documents.get(&uri)
+            && let Some(ref program) = doc.program {
                 for declaration in &program.declarations {
                     if let Declaration::Class(class) = declaration {
                         ranges.push(FoldingRange {
@@ -674,7 +668,6 @@ impl LanguageServer for Backend {
                     }
                 }
             }
-        }
 
         Ok(Some(ranges))
     }

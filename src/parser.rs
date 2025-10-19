@@ -498,8 +498,8 @@ impl Parser {
 
         // Check if this looks like a config.cpp style field (identifier followed by [ or =)
         // e.g., fieldName[]=value; or fieldName=value;
-        if let Some(token) = self.current_opt() {
-            if let TokenType::Identifier(first_name) = &token.token_type {
+        if let Some(token) = self.current_opt()
+            && let TokenType::Identifier(first_name) = &token.token_type {
                 let first_name_clone = first_name.clone();
                 self.advance();
 
@@ -521,7 +521,6 @@ impl Parser {
                 // Rewind one step to re-parse as type
                 self.position -= 1;
             }
-        }
 
         // Standard Enforce Script: type name = value; or type name(...) { }
         let type_ref = self.parse_type()?;
@@ -1700,13 +1699,12 @@ impl Parser {
     }
 
     fn consume_identifier(&mut self, message: &str) -> Result<String, String> {
-        if let Some(token) = self.current_opt() {
-            if let TokenType::Identifier(name) = &token.token_type {
+        if let Some(token) = self.current_opt()
+            && let TokenType::Identifier(name) = &token.token_type {
                 let result = name.clone();
                 self.advance();
                 return Ok(result);
             }
-        }
         Err(format!("{} at line {}", message, self.current().line))
     }
 
@@ -1714,14 +1712,13 @@ impl Parser {
         self.advance();
 
         while !self.is_at_end() {
-            if let Some(prev) = self.previous() {
-                if matches!(prev.token_type, TokenType::Semicolon) {
+            if let Some(prev) = self.previous()
+                && matches!(prev.token_type, TokenType::Semicolon) {
                     return;
                 }
-            }
 
-            if let Some(curr) = self.current_opt() {
-                if matches!(
+            if let Some(curr) = self.current_opt()
+                && matches!(
                     curr.token_type,
                     TokenType::Class
                         | TokenType::Enum
@@ -1738,7 +1735,6 @@ impl Parser {
                 ) {
                     return;
                 }
-            }
 
             self.advance();
         }
