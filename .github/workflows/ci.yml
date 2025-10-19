@@ -14,12 +14,17 @@ jobs:
     build:
         name: Build Project and Tests
         runs-on: ubuntu-latest
+        env:
+            SCCACHE_GHA_ENABLED: "true"
+            RUSTC_WRAPPER: "sccache"
         steps:
             - uses: actions/checkout@v5
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@stable
+            - name: Setup sccache
+              uses: mozilla-actions/sccache-action@v0.0.9
             - name: Cache Dependencies
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: |
                       ~/.cargo/registry/index/
@@ -28,39 +33,29 @@ jobs:
                   key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: |
                       ${{ runner.os }}-cargo-
-            - name: Cache Build Artifacts
-              uses: actions/cache@v3
-              with:
-                  path: target/
-                  key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
-                  restore-keys: |
-                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
-                      ${{ runner.os }}-target-
-            - name: Restore timestamps
-              run: |
-                  # Use git to restore original file timestamps
-                  # This prevents Cargo from seeing files as "changed" after cache restore
-                  git ls-tree -r --name-only HEAD | while read filename; do
-                    if [ -f "$filename" ]; then
-                      touch -d "$(git log -1 --format=%ci -- "$filename")" "$filename"
-                    fi
-                  done
             - name: Build Project
               run: cargo build --verbose
             - name: Build Tests
               run: cargo test --no-run --verbose
+            - name: Show sccache stats
+              run: sccache --show-stats
 
     # Run all tests
     test:
         needs: build
         name: Run Tests
         runs-on: ubuntu-latest
+        env:
+            SCCACHE_GHA_ENABLED: "true"
+            RUSTC_WRAPPER: "sccache"
         steps:
             - uses: actions/checkout@v5
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@stable
+            - name: Setup sccache
+              uses: mozilla-actions/sccache-action@v0.0.9
             - name: Restore Dependencies
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: |
                       ~/.cargo/registry/index/
@@ -69,14 +64,6 @@ jobs:
                   key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: |
                       ${{ runner.os }}-cargo-
-            - name: Restore Build Artifacts
-              uses: actions/cache@v3
-              with:
-                  path: target/
-                  key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
-                  restore-keys: |
-                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
-                      ${{ runner.os }}-target-
             - name: Run Tests
               run: cargo test --verbose
 
@@ -91,24 +78,6 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
               with:
                   components: rustfmt
-            - name: Restore Dependencies
-              uses: actions/cache@v3
-              with:
-                  path: |
-                      ~/.cargo/registry/index/
-                      ~/.cargo/registry/cache/
-                      ~/.cargo/git/db/
-                  key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-                  restore-keys: |
-                      ${{ runner.os }}-cargo-
-            - name: Restore Build Artifacts
-              uses: actions/cache@v3
-              with:
-                  path: target/
-                  key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
-                  restore-keys: |
-                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
-                      ${{ runner.os }}-target-
             - name: Check formatting
               run: cargo fmt --all -- --check
 
@@ -117,14 +86,19 @@ jobs:
         needs: build
         name: Run Clippy Lints
         runs-on: ubuntu-latest
+        env:
+            SCCACHE_GHA_ENABLED: "true"
+            RUSTC_WRAPPER: "sccache"
         steps:
             - uses: actions/checkout@v5
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@stable
               with:
                   components: clippy
+            - name: Setup sccache
+              uses: mozilla-actions/sccache-action@v0.0.9
             - name: Restore Dependencies
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: |
                       ~/.cargo/registry/index/
@@ -133,14 +107,6 @@ jobs:
                   key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: |
                       ${{ runner.os }}-cargo-
-            - name: Restore Build Artifacts
-              uses: actions/cache@v3
-              with:
-                  path: target/
-                  key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
-                  restore-keys: |
-                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
-                      ${{ runner.os }}-target-
             - name: Run clippy
               run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -149,12 +115,17 @@ jobs:
         needs: build
         name: Build Documentation
         runs-on: ubuntu-latest
+        env:
+            SCCACHE_GHA_ENABLED: "true"
+            RUSTC_WRAPPER: "sccache"
         steps:
             - uses: actions/checkout@v5
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@stable
+            - name: Setup sccache
+              uses: mozilla-actions/sccache-action@v0.0.9
             - name: Restore Dependencies
-              uses: actions/cache@v3
+              uses: actions/cache@v4
               with:
                   path: |
                       ~/.cargo/registry/index/
@@ -163,13 +134,5 @@ jobs:
                   key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: |
                       ${{ runner.os }}-cargo-
-            - name: Restore Build Artifacts
-              uses: actions/cache@v3
-              with:
-                  path: target/
-                  key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
-                  restore-keys: |
-                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
-                      ${{ runner.os }}-target-
             - name: Build documentation
               run: cargo doc --no-deps --document-private-items
