@@ -1,0 +1,164 @@
+name: "CI Checks"
+
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+        branches:
+            - main
+    workflow_dispatch:
+
+jobs:
+    # Ensure compilation with no warnings or errors
+    build:
+        name: Build Project and Tests
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@stable
+            - name: Cache Dependencies
+              uses: actions/cache@v3
+              with:
+                  path: |
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                  key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-
+            - name: Cache Build Artifacts
+              uses: actions/cache@v3
+              with:
+                  path: target/
+                  key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
+                  restore-keys: |
+                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+                      ${{ runner.os }}-target-
+            - name: Build Project
+              run: cargo build --verbose
+            - name: Build Tests
+              run: cargo test --no-run --verbose
+
+    # Run all tests
+    test:
+        needs: build
+        name: Run Tests
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@stable
+            - name: Restore Dependencies
+              uses: actions/cache@v3
+              with:
+                  path: |
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                  key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-
+            - name: Restore Build Artifacts
+              uses: actions/cache@v3
+              with:
+                  path: target/
+                  key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
+                  restore-keys: |
+                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+                      ${{ runner.os }}-target-
+
+    # Check code formatting
+    format:
+        needs: build
+        name: Check Formatting
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: rustfmt
+            - name: Restore Dependencies
+              uses: actions/cache@v3
+              with:
+                  path: |
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                  key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-
+            - name: Restore Build Artifacts
+              uses: actions/cache@v3
+              with:
+                  path: target/
+                  key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
+                  restore-keys: |
+                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+                      ${{ runner.os }}-target-
+            - name: Check formatting
+              run: cargo fmt --all -- --check
+
+    # Run clippy linting
+    clippy:
+        needs: build
+        name: Run Clippy Lints
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: clippy
+            - name: Restore Dependencies
+              uses: actions/cache@v3
+              with:
+                  path: |
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                  key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-
+            - name: Restore Build Artifacts
+              uses: actions/cache@v3
+              with:
+                  path: target/
+                  key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
+                  restore-keys: |
+                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+                      ${{ runner.os }}-target-
+            - name: Run clippy
+              run: cargo clippy --all-targets --all-features -- -D warnings
+
+    # Check documentation builds
+    docs:
+        needs: build
+        name: Build Documentation
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@stable
+            - name: Restore Dependencies
+              uses: actions/cache@v3
+              with:
+                  path: |
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                  key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-
+            - name: Restore Build Artifacts
+              uses: actions/cache@v3
+              with:
+                  path: target/
+                  key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}
+                  restore-keys: |
+                      ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+                      ${{ runner.os }}-target-
+            - name: Build documentation
+              run: cargo doc --no-deps --document-private-items
