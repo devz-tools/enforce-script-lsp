@@ -1,9 +1,5 @@
 # Enforce Script Language Server
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-102%20passing-brightgreen)]()
-[![License](https://img.shields.io/badge/license-MIT-blue)]()
-
 A comprehensive Language Server Protocol (LSP) implementation for Enforce Script, the scripting language used by the Enfusion game engine and for modding video games such as DayZ.
 
 ## 🚀 Quick Start
