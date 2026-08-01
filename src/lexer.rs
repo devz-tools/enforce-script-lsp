@@ -339,6 +339,7 @@ impl Lexer {
         }
 
         let mut is_float = false;
+        let mut is_hex = false;
 
         // Handle decimal point
         if !self.is_at_end()
@@ -351,9 +352,19 @@ impl Lexer {
                 self.advance();
             }
         }
-
+        // Handle hex numbers
+        if !self.is_at_end()
+            && self.input.get(self.position - 1) == Some(&'0')
+            && (self.current_char() == 'x' || self.current_char() == 'X')
+        {
+            is_hex = true;
+            self.advance();
+            while !self.is_at_end() && self.current_char().is_ascii_hexdigit() {
+                self.advance();
+            }
+        }
         // Handle scientific notation
-        if !self.is_at_end() && (self.current_char() == 'e' || self.current_char() == 'E') {
+        else if !self.is_at_end() && (self.current_char() == 'e' || self.current_char() == 'E') {
             is_float = true;
             self.advance();
             if !self.is_at_end() && (self.current_char() == '+' || self.current_char() == '-') {
@@ -370,7 +381,19 @@ impl Lexer {
             let value = lexeme.parse::<f64>().unwrap_or(0.0);
             Token::new(TokenType::FloatLiteral(value), lexeme, line, column, offset)
         } else {
-            let value = lexeme.parse::<i64>().unwrap_or(0);
+            let value = if is_hex {
+                i64::from_str_radix(
+                    &lexeme
+                        .to_lowercase()
+                        .split_inclusive('x')
+                        .last()
+                        .unwrap_or("0"),
+                    16,
+                )
+                .unwrap()
+            } else {
+                lexeme.parse::<i64>().unwrap_or(0)
+            };
             Token::new(TokenType::IntLiteral(value), lexeme, line, column, offset)
         }
     }
@@ -737,11 +760,19 @@ class MyClass
         let tokens = lexer.tokenize();
 
         // Hex numbers are parsed as IntLiteral - filter out whitespace/newlines
-        let num_tokens: Vec<_> = tokens
+        let num_tokens: Vec<&TokenType> = tokens
             .iter()
             .filter(|t| matches!(t.token_type, TokenType::IntLiteral(_)))
+            .map(|t| &t.token_type)
             .collect();
-        assert_eq!(num_tokens.len(), 3);
+        assert_eq!(
+            num_tokens,
+            vec![
+                &TokenType::IntLiteral(0x1a),
+                &TokenType::IntLiteral(0xff),
+                &TokenType::IntLiteral(0x00)
+            ]
+        );
     }
 
     #[test]
