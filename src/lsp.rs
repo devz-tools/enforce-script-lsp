@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::RwLock;
 /// LSP Server implementation for Enforce Script
@@ -35,7 +36,22 @@ impl Backend {
     }
 
     async fn analyze_document(&self, uri: &str, text: &str) {
+        // Determine active defines from the file's module config.cpp, so #ifdef
+        // branches are kept/skipped correctly.
+        let defines: HashSet<String> = Url::parse(uri)
+            .ok()
+            .and_then(|u| u.to_file_path().ok())
+            .and_then(|path| {
+                self.workspace
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .map(|ws| ws.defines_for(&path))
+            })
+            .unwrap_or_default();
+
         let mut lexer = Lexer::new(text);
+        lexer.set_active_defines(&defines);
         let tokens = lexer.tokenize();
 
         let mut diagnostics = Vec::new();

@@ -145,6 +145,20 @@ impl Workspace {
             .iter()
             .any(|dir| path.starts_with(dir))
     }
+
+    /// Active `defines[]` for the module that owns `path`, found by walking up
+    /// from the file to the nearest `config.cpp`.
+    pub fn defines_for(&self, path: &Path) -> HashSet<String> {
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            let config = d.join("config.cpp");
+            if let Some(cfg) = self.configs.iter().find(|c| c.path == config) {
+                return cfg.defines.iter().cloned().collect();
+            }
+            dir = d.parent();
+        }
+        HashSet::new()
+    }
 }
 
 /// Recursively find all `config.cpp` files under `root`, skipping junk dirs.
