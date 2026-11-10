@@ -32,6 +32,18 @@ pub struct LintIssue {
     pub is_error: bool,
 }
 
+/// Built-in class/type names that a field or variable must not shadow.
+/// Naming one after these crashes the engine on script load
+/// (`Variable name '<X>' already used as type name` → segfault), and
+/// AddonBuilder does NOT catch it (codeguide rule #1).
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "Surface", "Object", "Game", "Shape", "LOD", "Car", "Human",
+];
+
+fn is_reserved_type_name(name: &str) -> bool {
+    RESERVED_TYPE_NAMES.contains(&name)
+}
+
 /// Run all Enforce-specific lint checks over the parsed program and token stream.
 pub fn lint(program: &Program, tokens: &[Token], config: &LintConfig) -> Vec<LintIssue> {
     let mut issues = Vec::new();
@@ -46,6 +58,16 @@ fn lint_declaration(decl: &Declaration, config: &LintConfig, issues: &mut Vec<Li
     match decl {
         Declaration::Class(class) => {
             for field in &class.fields {
+                if is_reserved_type_name(&field.name) {
+                    issues.push(LintIssue {
+                        message: format!(
+                            "Field '{}' shadows a built-in class name (engine crash on startup)",
+                            field.name
+                        ),
+                        line: field.span.start.line,
+                        is_error: true,
+                    });
+                }
                 if let Some(init) = &field.initializer {
                     lint_expression(init, config, issues, None);
                 }
@@ -91,6 +113,16 @@ fn lint_statement(
                 issues.push(LintIssue {
                     message: format!(
                         "Variable '{}' declared more than once in the same method",
+                        name
+                    ),
+                    line: span.start.line,
+                    is_error: true,
+                });
+            }
+            if is_reserved_type_name(name) {
+                issues.push(LintIssue {
+                    message: format!(
+                        "Variable '{}' shadows a built-in class name (engine crash on startup)",
                         name
                     ),
                     line: span.start.line,
@@ -361,6 +393,13 @@ void F()
 "#;
         let issues = lint_code(code);
         assert!(!issues.iter().any(|i| i.message.contains("declared more than once")));
+    }
+
+    #[test]
+    fn test_field_shadows_builtin_class() {
+        let code = "class F { int Surface; }";
+        let issues = lint_code(code);
+        assert!(issues.iter().any(|i| i.message.contains("shadows a built-in")));
     }
 
     #[test]
