@@ -81,6 +81,10 @@ impl Backend {
 
         let symbol_table = if let Some(ref prog) = program {
             let mut analyzer = SemanticAnalyzer::new();
+            // Resolve cross-file identifiers (globals, inherited members).
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+                analyzer.set_global_environment(index.environment());
+            }
             match analyzer.analyze(prog) {
                 Ok(_) => {
                     // Add warnings as diagnostics

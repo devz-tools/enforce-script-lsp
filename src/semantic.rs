@@ -1,7 +1,7 @@
 /// Semantic analyzer for Enforce Script
 /// Performs type checking, scope resolution, and builds symbol table
 use crate::parser::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SymbolKind {
@@ -136,6 +136,36 @@ pub struct SemanticAnalyzer {
     errors: Vec<String>,
     warnings: Vec<String>,
     class_hierarchy: HashMap<String, Option<String>>, // class -> parent class
+    global_env: GlobalEnvironment,
+}
+
+/// Cross-file symbol environment: globals, class hierarchy and members, used to
+/// resolve identifiers that live outside the current file (inherited fields,
+/// global enums/classes/functions/constants).
+#[derive(Debug, Default, Clone)]
+pub struct GlobalEnvironment {
+    /// Names of global symbols (classes, enums, typedefs, functions, globals).
+    pub globals: HashSet<String>,
+    /// class name → parent class name (from `class X : Parent`).
+    pub class_parents: HashMap<String, Option<String>>,
+    /// class name → set of member names (fields, methods, enum variants).
+    pub class_members: HashMap<String, HashSet<String>>,
+}
+
+impl GlobalEnvironment {
+    /// Whether `name` is a member of `class` or any of its ancestors.
+    pub fn has_member(&self, class: &str, name: &str) -> bool {
+        let mut current = Some(class.to_string());
+        while let Some(c) = current {
+            if let Some(members) = self.class_members.get(&c)
+                && members.contains(name)
+            {
+                return true;
+            }
+            current = self.class_parents.get(&c).cloned().flatten();
+        }
+        false
+    }
 }
 
 impl SemanticAnalyzer {
@@ -145,7 +175,12 @@ impl SemanticAnalyzer {
             errors: Vec::new(),
             warnings: Vec::new(),
             class_hierarchy: HashMap::new(),
+            global_env: GlobalEnvironment::default(),
         }
+    }
+
+    pub fn set_global_environment(&mut self, env: GlobalEnvironment) {
+        self.global_env = env;
     }
 
     pub fn analyze(&mut self, program: &Program) -> Result<(), Vec<String>> {
@@ -547,8 +582,15 @@ impl SemanticAnalyzer {
             Expression::Identifier(name, span) => {
                 // Check if identifier is defined
                 if self.symbol_table.lookup(name).is_none() {
-                    // Check if it's an enum variant
-                    if !name.contains('.') {
+                    // Resolve cross-file: a known global symbol, or a member
+                    // inherited from an ancestor of the current class.
+                    let known_global = self.global_env.globals.contains(name);
+                    let inherited = self
+                        .symbol_table
+                        .current_class
+                        .as_deref()
+                        .is_some_and(|c| self.global_env.has_member(c, name));
+                    if !name.contains('.') && !known_global && !inherited {
                         self.warnings.push(format!(
                             "Undefined identifier '{}' at line {}",
                             name, span.start.line
@@ -622,6 +664,64 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+
+    #[test]
+    fn test_global_environment_has_member() {
+        let mut env = GlobalEnvironment::default();
+        env.class_parents
+            .insert("Child".to_string(), Some("Parent".to_string()));
+        env.class_parents
+            .insert("Parent".to_string(), Some("Grand".to_string()));
+        env.class_members
+            .entry("Grand".to_string())
+            .or_default()
+            .insert("m_legacy".to_string());
+        env.class_members
+            .entry("Parent".to_string())
+            .or_default()
+            .insert("m_base".to_string());
+
+        assert!(env.has_member("Child", "m_base"));
+        assert!(env.has_member("Child", "m_legacy")); // through two levels
+        assert!(!env.has_member("Child", "nope"));
+    }
+
+    #[test]
+    fn test_cross_file_inherited_and_global_resolution() {
+        // References a global enum and an inherited field, both "defined" in the
+        // environment — must not warn.
+        let code = r#"
+class Child : Parent
+{
+    void Child()
+    {
+        m_field = MyEnum.VALUE;
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut env = GlobalEnvironment::default();
+        env.class_parents
+            .insert("Child".to_string(), Some("Parent".to_string()));
+        env.class_members
+            .entry("Parent".to_string())
+            .or_default()
+            .insert("m_field".to_string());
+        env.globals.insert("MyEnum".to_string());
+
+        let mut analyzer = SemanticAnalyzer::new();
+        analyzer.set_global_environment(env);
+        let _ = analyzer.analyze(&program);
+
+        assert!(!analyzer
+            .warnings
+            .iter()
+            .any(|w| w.contains("m_field") || w.contains("MyEnum")));
+    }
 
     #[test]
     fn test_semantic_analysis() {

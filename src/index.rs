@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::lexer::Lexer;
-use crate::parser::Parser;
-use crate::semantic::{SemanticAnalyzer, Symbol};
+use crate::parser::{Declaration, Parser};
+use crate::semantic::{GlobalEnvironment, SemanticAnalyzer, Symbol};
 use crate::workspace::Workspace;
 
 /// A symbol occurrence together with its defining file.
@@ -17,6 +17,8 @@ pub struct IndexedSymbol {
 #[derive(Debug, Default)]
 pub struct SymbolIndex {
     pub by_name: HashMap<String, Vec<IndexedSymbol>>,
+    /// class name → parent class name (from `class X : Parent`).
+    pub class_parents: HashMap<String, Option<String>>,
 }
 
 impl SymbolIndex {
@@ -31,6 +33,29 @@ impl SymbolIndex {
 
     pub fn lookup(&self, name: &str) -> &[IndexedSymbol] {
         self.by_name.get(name).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Derive the cross-file environment (globals + class hierarchy + members)
+    /// used to resolve identifiers outside the current file.
+    pub fn environment(&self) -> GlobalEnvironment {
+        let mut env = GlobalEnvironment::default();
+        for (name, occs) in &self.by_name {
+            for occ in occs {
+                match &occ.symbol.parent {
+                    None => {
+                        env.globals.insert(name.clone());
+                    }
+                    Some(parent) => {
+                        env.class_members
+                            .entry(parent.clone())
+                            .or_default()
+                            .insert(name.clone());
+                    }
+                }
+            }
+        }
+        env.class_parents = self.class_parents.clone();
+        env
     }
 }
 
@@ -61,6 +86,15 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
     let Ok(program) = parser.parse() else {
         return;
     };
+
+    // Record the class hierarchy (`class X : Parent`).
+    for decl in &program.declarations {
+        if let Declaration::Class(class) = decl {
+            index
+                .class_parents
+                .insert(class.name.clone(), class.extends.clone());
+        }
+    }
 
     let mut analyzer = SemanticAnalyzer::new();
     let _ = analyzer.analyze(&program);
