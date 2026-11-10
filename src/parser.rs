@@ -788,6 +788,9 @@ impl Parser {
             let type_ref = self.parse_type()?;
             let name = self.consume_identifier("Expected parameter name")?;
 
+            // Array parameter: `out vector mat[3]`, `float arr[]`.
+            self.consume_array_brackets()?;
+
             let default_value = if self.match_token(&[TokenType::Assign]) {
                 Some(self.parse_expression()?)
             } else {
@@ -819,10 +822,23 @@ impl Parser {
         }
 
         let mut modifiers = Vec::new();
-        while self.match_token(&[TokenType::Ref, TokenType::Autoptr]) {
-            if let Some(token) = self.previous() {
-                modifiers.push(token.lexeme.clone());
+        loop {
+            if self.match_token(&[TokenType::Ref, TokenType::Autoptr]) {
+                if let Some(token) = self.previous() {
+                    modifiers.push(token.lexeme.clone());
+                }
+                continue;
             }
+            // `volatile` / `owned` are type modifiers tokenized as identifiers.
+            if let Some(token) = self.current_opt()
+                && let TokenType::Identifier(name) = &token.token_type
+                && (name == "volatile" || name == "owned")
+            {
+                modifiers.push(name.clone());
+                self.advance();
+                continue;
+            }
+            break;
         }
 
         let base_type = if self.match_token(&[

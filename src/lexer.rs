@@ -321,10 +321,8 @@ impl Lexer {
                 self.advance(); // '/'
                 break;
             }
-            if self.current_char() == '\n' {
-                self.line += 1;
-                self.column = 0;
-            }
+            // Note: `advance()` already increments `line` on '\n' — don't count
+            // it again here (that would double-count lines in block comments).
             self.advance();
         }
 
@@ -495,6 +493,11 @@ impl Lexer {
                 TokenType::Identifier(lexeme.clone())
             }
             "vector" => TokenType::Vector,
+            // `typename` is both a primitive type and a global object
+            // (e.g. `typename.EnumToString`), same as `vector`.
+            "typename" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "typename" => TokenType::Typename,
             "auto" => TokenType::Auto,
             "autoptr" => TokenType::Autoptr,

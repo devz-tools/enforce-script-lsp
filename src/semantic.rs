@@ -345,6 +345,9 @@ impl SemanticAnalyzer {
 
     fn analyze_class(&mut self, class: &Class) -> Result<(), Vec<String>> {
         self.symbol_table.current_class = Some(class.name.clone());
+        // Class members live in their own scope, so same-named members across
+        // different classes (e.g. `MIN` in `class int` and `class float`) don't collide.
+        self.symbol_table.enter_scope();
 
         // Register fields
         for field in &class.fields {
@@ -373,6 +376,7 @@ impl SemanticAnalyzer {
             self.analyze_method(method, Some(class.name.clone()))?;
         }
 
+        self.symbol_table.exit_scope();
         self.symbol_table.current_class = None;
         Ok(())
     }
