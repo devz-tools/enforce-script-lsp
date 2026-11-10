@@ -295,6 +295,7 @@ pub enum Declaration {
     Enum(Enum),
     Typedef(Typedef),
     Function(Box<Method>), // Global functions
+    Variable(Field),       // Module-level variables (e.g. `static const string X = ...`)
 }
 
 #[derive(Debug, Clone)]
@@ -369,8 +370,8 @@ impl Parser {
         } else if self.check(&TokenType::Typedef) {
             self.parse_typedef()
         } else {
-            // Try to parse as function
-            self.parse_function(modifiers)
+            // Function or module-level variable (e.g. `static const string X = ...`).
+            self.parse_function_or_global(modifiers)
         }
     }
 
@@ -666,6 +667,9 @@ impl Parser {
         let end_offset = self.current().offset;
         self.consume(&TokenType::RightBrace, "Expected '}'")?;
 
+        // Optional semicolon after enum closing brace (DayZ style `enum X { ... };`)
+        self.match_token(&[TokenType::Semicolon]);
+
         let end = Position::new(end_line, end_column, end_offset);
         let span = Span::new(start, end);
 
@@ -696,12 +700,19 @@ impl Parser {
         }))
     }
 
-    fn parse_function(&mut self, modifiers: Vec<String>) -> Result<Declaration, String> {
-        let return_type = self.parse_type()?;
-        let name = self.consume_identifier("Expected function name")?;
+    fn parse_function_or_global(&mut self, modifiers: Vec<String>) -> Result<Declaration, String> {
+        let type_ref = self.parse_type()?;
+        let name = self.consume_identifier("Expected function or variable name")?;
 
-        let method = self.parse_method_rest(modifiers, return_type, name)?;
-        Ok(Declaration::Function(Box::new(method)))
+        // A following '(' marks a function; otherwise it's a module-level variable
+        // (e.g. `static const string DM_BOTORAMA_VERSION = "3.521";`).
+        if self.check(&TokenType::LeftParen) {
+            let method = self.parse_method_rest(modifiers, type_ref, name)?;
+            Ok(Declaration::Function(Box::new(method)))
+        } else {
+            let field = self.parse_field_rest(modifiers, type_ref, name)?;
+            Ok(Declaration::Variable(field))
+        }
     }
 
     fn parse_parameters(&mut self) -> Result<Vec<Parameter>, String> {
@@ -1963,6 +1974,23 @@ void Test()
         let result = parser.parse();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_global_constants() {
+        let code = r#"
+static const string VERSION = "3.521";
+static const float DROP_COEF_INIT = 0.8;
+static const int MAX_COUNT = 100;
+enum POIType { NONE = 0, WATER };
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_ok());
+        assert!(parser.get_errors().is_empty());
     }
 
     #[test]

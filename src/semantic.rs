@@ -161,6 +161,9 @@ impl SemanticAnalyzer {
                 Declaration::Typedef(typedef) => {
                     self.register_typedef(typedef)?;
                 }
+                Declaration::Variable(field) => {
+                    self.register_global_variable(field)?;
+                }
                 Declaration::Function(_) => {} // Handle in second pass
             }
         }
@@ -268,6 +271,24 @@ impl SemanticAnalyzer {
             span: typedef.span.clone(),
             scope: 0,
             modifiers: Vec::new(),
+            parent: None,
+        };
+
+        if let Err(e) = self.symbol_table.define(symbol) {
+            self.errors.push(e);
+        }
+
+        Ok(())
+    }
+
+    fn register_global_variable(&mut self, field: &Field) -> Result<(), Vec<String>> {
+        let symbol = Symbol {
+            name: field.name.clone(),
+            kind: SymbolKind::Variable,
+            type_ref: Some(field.type_ref.clone()),
+            span: field.span.clone(),
+            scope: 0,
+            modifiers: field.modifiers.clone(),
             parent: None,
         };
 
