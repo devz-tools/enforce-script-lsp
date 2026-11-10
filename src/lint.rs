@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::lexer::{Token, TokenType};
 use crate::parser::{Declaration, Expression, Program, Statement};
 
@@ -50,13 +52,15 @@ fn lint_declaration(decl: &Declaration, config: &LintConfig, issues: &mut Vec<Li
             }
             for method in &class.methods {
                 if let Some(body) = &method.body {
-                    lint_statement(body, config, issues);
+                    let mut declared = HashSet::new();
+                    lint_statement(body, config, issues, &mut declared);
                 }
             }
         }
         Declaration::Function(method) => {
             if let Some(body) = &method.body {
-                lint_statement(body, config, issues);
+                let mut declared = HashSet::new();
+                lint_statement(body, config, issues, &mut declared);
             }
         }
         Declaration::Variable(field) => {
@@ -68,9 +72,31 @@ fn lint_declaration(decl: &Declaration, config: &LintConfig, issues: &mut Vec<Li
     }
 }
 
-fn lint_statement(stmt: &Statement, config: &LintConfig, issues: &mut Vec<LintIssue>) {
+fn lint_statement(
+    stmt: &Statement,
+    config: &LintConfig,
+    issues: &mut Vec<LintIssue>,
+    declared: &mut HashSet<String>,
+) {
     match stmt {
-        Statement::VariableDeclaration { initializer, .. } => {
+        Statement::VariableDeclaration {
+            name,
+            initializer,
+            span,
+            ..
+        } => {
+            // Enforce has no block scope — a variable name can only be declared
+            // once per function, even in different blocks / for-loop initializers.
+            if !declared.insert(name.clone()) {
+                issues.push(LintIssue {
+                    message: format!(
+                        "Variable '{}' declared more than once in the same method",
+                        name
+                    ),
+                    line: span.start.line,
+                    is_error: true,
+                });
+            }
             if let Some(init) = initializer {
                 lint_expression(init, config, issues, None);
             }
@@ -80,7 +106,7 @@ fn lint_statement(stmt: &Statement, config: &LintConfig, issues: &mut Vec<LintIs
         }
         Statement::Block { statements, .. } => {
             for s in statements {
-                lint_statement(s, config, issues);
+                lint_statement(s, config, issues, declared);
             }
         }
         Statement::If {
@@ -90,9 +116,9 @@ fn lint_statement(stmt: &Statement, config: &LintConfig, issues: &mut Vec<LintIs
             ..
         } => {
             lint_expression(condition, config, issues, None);
-            lint_statement(then_branch, config, issues);
+            lint_statement(then_branch, config, issues, declared);
             if let Some(e) = else_branch {
-                lint_statement(e, config, issues);
+                lint_statement(e, config, issues, declared);
             }
         }
         Statement::Switch {
@@ -104,7 +130,7 @@ fn lint_statement(stmt: &Statement, config: &LintConfig, issues: &mut Vec<LintIs
                     lint_expression(ce, config, issues, None);
                 }
                 for s in case_stmts {
-                    lint_statement(s, config, issues);
+                    lint_statement(s, config, issues, declared);
                 }
             }
         }
@@ -116,7 +142,7 @@ fn lint_statement(stmt: &Statement, config: &LintConfig, issues: &mut Vec<LintIs
             ..
         } => {
             if let Some(i) = initializer {
-                lint_statement(i, config, issues);
+                lint_statement(i, config, issues, declared);
             }
             if let Some(c) = condition {
                 lint_expression(c, config, issues, None);
@@ -124,15 +150,15 @@ fn lint_statement(stmt: &Statement, config: &LintConfig, issues: &mut Vec<LintIs
             if let Some(inc) = increment {
                 lint_expression(inc, config, issues, None);
             }
-            lint_statement(body, config, issues);
+            lint_statement(body, config, issues, declared);
         }
         Statement::Foreach { iterable, body, .. } => {
             lint_expression(iterable, config, issues, None);
-            lint_statement(body, config, issues);
+            lint_statement(body, config, issues, declared);
         }
         Statement::While { condition, body, .. } => {
             lint_expression(condition, config, issues, None);
-            lint_statement(body, config, issues);
+            lint_statement(body, config, issues, declared);
         }
         Statement::Return { value, .. } => {
             if let Some(v) = value {
@@ -305,6 +331,36 @@ mod tests {
         let code = r#"void F(bool c) { string s = c ? "a" : "b"; }"#;
         let issues = lint_code(code);
         assert!(issues.iter().any(|i| i.message.contains("Ternary")));
+    }
+
+    #[test]
+    fn test_duplicate_variable_declaration() {
+        // Two `for (int i = ...)` loops — Enforce has no block scope, so the
+        // second `i` declaration is an error.
+        let code = r#"
+void F()
+{
+    for (int i = 0; i < 5; i++) {}
+    for (int i = 0; i < 5; i++) {}
+}
+"#;
+        let issues = lint_code(code);
+        assert!(issues.iter().any(|i| i.message.contains("declared more than once")));
+    }
+
+    #[test]
+    fn test_single_declaration_not_flagged() {
+        // The correct pattern: declare `i` once, use it in both loops.
+        let code = r#"
+void F()
+{
+    int i;
+    for (i = 0; i < 5; i++) {}
+    for (i = 0; i < 5; i++) {}
+}
+"#;
+        let issues = lint_code(code);
+        assert!(!issues.iter().any(|i| i.message.contains("declared more than once")));
     }
 
     #[test]
