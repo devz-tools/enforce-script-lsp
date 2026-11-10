@@ -489,6 +489,21 @@ impl Parser {
         }
     }
 
+    /// Consume an optional array size after a name: `[N]` or `[]`
+    /// (e.g. `float arr[4];`). No-op when there is no `[`.
+    fn consume_array_brackets(&mut self) -> Result<(), String> {
+        if !self.match_token(&[TokenType::LeftBracket]) {
+            return Ok(());
+        }
+        if let Some(token) = self.current_opt() {
+            if let TokenType::IntLiteral(_) = token.token_type {
+                self.advance();
+            }
+        }
+        self.consume(&TokenType::RightBracket, "Expected ']' after '['")?;
+        Ok(())
+    }
+
     fn parse_class_member(&mut self) -> Result<(Vec<Method>, Vec<Field>), String> {
         let mut modifiers = Vec::new();
 
@@ -547,11 +562,8 @@ impl Parser {
         let type_ref = self.parse_type()?;
         let name = self.consume_identifier("Expected member name")?;
 
-        // Check for array brackets (e.g., int myArray[10];)
-        let is_array_field = self.match_token(&[TokenType::LeftBracket]);
-        if is_array_field {
-            self.consume(&TokenType::RightBracket, "Expected ']' after '['")?;
-        }
+        // Array field: `float arr[4];` or `float arr[];`
+        self.consume_array_brackets()?;
 
         // Check if it's a method (has parentheses)
         if self.check(&TokenType::LeftParen) {
@@ -937,6 +949,9 @@ impl Parser {
             let start = Position::from_token(self.current());
             let type_ref = self.parse_type()?;
             let name = self.consume_identifier("Expected variable name")?;
+
+            // Array variable: `float arr[4];`
+            self.consume_array_brackets()?;
 
             let initializer = if self.match_token(&[TokenType::Assign]) {
                 Some(self.parse_expression()?)
@@ -2083,6 +2098,29 @@ void Test()
         let result = parser.parse();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_array_fields_and_vars() {
+        let code = r#"
+class MyClass
+{
+    float m_ProbeSeen[4];
+    vector m_ProbePos[4];
+    void Method()
+    {
+        int arr[10];
+        float matrix[3];
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_ok());
+        assert!(parser.get_errors().is_empty());
     }
 
     #[test]
