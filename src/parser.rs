@@ -882,7 +882,7 @@ impl Parser {
                 // Check for template parameters
                 if self.match_token(&[TokenType::Less]) {
                     let params = self.parse_type_parameters()?;
-                    self.consume(&TokenType::Greater, "Expected '>'")?;
+                    self.consume_gt("Expected '>'")?;
                     TypeRef::Template(type_name, params)
                 } else {
                     TypeRef::Class(type_name)
@@ -1088,6 +1088,9 @@ impl Parser {
                 match &self.tokens[i].token_type {
                     TokenType::Less => depth += 1,
                     TokenType::Greater => depth -= 1,
+                    // Nested generics `map<string, ref array<int>>` — a `>>`
+                    // closes two template lists.
+                    TokenType::RightShift => depth = depth.saturating_sub(2),
                     _ => {}
                 }
                 i += 1;
@@ -1145,6 +1148,13 @@ impl Parser {
                 TokenType::Less => depth += 1,
                 TokenType::Greater => {
                     depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                // Nested generics `A<B<C>>.` — a `>>` closes two lists.
+                TokenType::RightShift => {
+                    depth = depth.saturating_sub(2);
                     if depth == 0 {
                         break;
                     }
@@ -1945,6 +1955,37 @@ impl Parser {
         }
     }
 
+    /// Consume a `>` closing a generic argument list, splitting a trailing `>>`
+    /// into two `>` tokens for nested generics like `map<string, ref array<int>>`.
+    fn consume_gt(&mut self, message: &str) -> Result<(), String> {
+        if self.check(&TokenType::Greater) {
+            self.advance();
+            return Ok(());
+        }
+        if self.check(&TokenType::RightShift) {
+            // Replace `>>` with `>` and insert a second `>` for the outer close.
+            let (line, column, offset) = {
+                let t = &self.tokens[self.position];
+                (t.line, t.column, t.offset)
+            };
+            self.tokens[self.position].token_type = TokenType::Greater;
+            self.tokens[self.position].lexeme = ">".to_string();
+            self.tokens.insert(
+                self.position + 1,
+                Token {
+                    token_type: TokenType::Greater,
+                    lexeme: ">".to_string(),
+                    line,
+                    column: column + 1,
+                    offset: offset + 1,
+                },
+            );
+            self.advance();
+            return Ok(());
+        }
+        Err(format!("{} at line {}", message, self.current().line))
+    }
+
     fn consume_identifier(&mut self, message: &str) -> Result<String, String> {
         if let Some(token) = self.current_opt()
             && let TokenType::Identifier(name) = &token.token_type
@@ -2432,6 +2473,29 @@ void Method()
         let result = parser.parse();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_nested_generics() {
+        let code = r#"
+class dmCampCoverFinder
+{
+    ref map<string, ref array<int>> m_DoorCache;
+    ref map<string, ref array<vector>> m_CoverCache;
+
+    void dmCampCoverFinder()
+    {
+        m_DoorCache = new map<string, ref array<int>>();
+        m_CoverCache = new map<string, ref array<vector>>();
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_ok(), "nested generics parse error: {:?}", result.err());
     }
 
     #[test]
