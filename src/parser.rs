@@ -120,6 +120,9 @@ pub enum Expression {
         expression: Box<Expression>,
         span: Span,
     },
+    /// A generic type reference used as an expression, e.g. the object of a
+    /// static access `JsonFileLoader<T>.SaveFile(...)`.
+    TypeRef(TypeRef, Span),
     Ternary {
         condition: Box<Expression>,
         then_expr: Box<Expression>,
@@ -148,6 +151,7 @@ impl Expression {
             Expression::This(span) => span,
             Expression::Super(span) => span,
             Expression::Cast { span, .. } => span,
+            Expression::TypeRef(_, span) => span,
             Expression::Ternary { span, .. } => span,
         }
     }
@@ -455,7 +459,7 @@ impl Parser {
         let mut params = Vec::new();
 
         loop {
-            self.consume(&TokenType::Class, "Expected 'class' in template parameter")?;
+            self.consume_template_param_kind()?;
             params.push(self.consume_identifier("Expected template parameter name")?);
 
             if !self.match_token(&[TokenType::Comma]) {
@@ -465,6 +469,24 @@ impl Parser {
 
         self.consume(&TokenType::Greater, "Expected '>'")?;
         Ok(params)
+    }
+
+    /// Consume a template parameter kind: `Class` (capital, tokenized as an
+    /// identifier), `typename`, or the legacy lowercase `class`.
+    fn consume_template_param_kind(&mut self) -> Result<(), String> {
+        if self.match_token(&[TokenType::Typename, TokenType::Class]) {
+            return Ok(());
+        }
+        let kind =
+            self.consume_identifier("Expected 'Class' or 'typename' in template parameter")?;
+        if kind == "Class" {
+            Ok(())
+        } else {
+            Err(format!(
+                "Expected 'Class' or 'typename' in template parameter, got '{}'",
+                kind
+            ))
+        }
     }
 
     fn parse_class_member(&mut self) -> Result<(Vec<Method>, Vec<Field>), String> {
@@ -1022,6 +1044,38 @@ impl Parser {
 
         // A declaration ends with the variable name.
         i < n && matches!(self.tokens[i].token_type, TokenType::Identifier(_))
+    }
+
+    /// Whether the current position is a generic type access `Identifier<T>.` —
+    /// an identifier, then template args, then a `.` (static access on a generic
+    /// type, e.g. `JsonFileLoader<T>.SaveFile(...)`).
+    fn is_generic_type_access(&self) -> bool {
+        let n = self.tokens.len();
+        let Some(tok) = self.current_opt() else {
+            return false;
+        };
+        if !matches!(tok.token_type, TokenType::Identifier(_)) {
+            return false;
+        }
+        let mut i = self.position + 1;
+        if i >= n || !matches!(self.tokens[i].token_type, TokenType::Less) {
+            return false;
+        }
+        let mut depth = 0usize;
+        while i < n {
+            match &self.tokens[i].token_type {
+                TokenType::Less => depth += 1,
+                TokenType::Greater => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        i + 1 < n && matches!(self.tokens[i + 1].token_type, TokenType::Dot)
     }
 
     fn parse_if_statement(&mut self) -> Result<Statement, String> {
@@ -1596,6 +1650,14 @@ impl Parser {
         if self.match_token(&[TokenType::Super]) {
             let token = self.previous().unwrap();
             return Ok(Expression::Super(Span::from_token(token)));
+        }
+
+        // Generic type access: `Identifier<T>.member` (static access on a generic type).
+        if self.is_generic_type_access() {
+            let start = Position::from_token(self.current());
+            let type_ref = self.parse_type()?;
+            let end = Position::from_token(self.previous().unwrap());
+            return Ok(Expression::TypeRef(type_ref, Span::new(start, end)));
         }
 
         if let Some(token) = self.current_opt() {
@@ -2528,6 +2590,32 @@ void Test()
         let result = parser.parse();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_generic_class_with_class_t() {
+        let code = r#"
+class dmJsonFile<Class T>
+{
+    private ref array<string> m_Errors;
+    bool Load(out T config)
+    {
+        return JsonFileLoader<T>.LoadFile("", config, "");
+    }
+    static bool Save(T config)
+    {
+        dmJsonFile<T> reader = new dmJsonFile<T>("");
+        return reader.Save(config);
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_ok());
+        assert!(parser.get_errors().is_empty());
     }
 
     #[test]

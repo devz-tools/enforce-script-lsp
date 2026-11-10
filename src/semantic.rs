@@ -65,10 +65,19 @@ impl SymbolTable {
 
         // Check for duplicate in current scope
         if let Some(existing) = self.scopes[self.current_scope].get(&name) {
-            return Err(format!(
-                "Symbol '{}' already defined in current scope at line {}",
-                name, existing.span.start.line
-            ));
+            // Static vs instance method overload is legal in Enforce (different
+            // namespaces), so don't flag it as a duplicate.
+            let both_methods = matches!(symbol.kind, SymbolKind::Method)
+                && matches!(existing.kind, SymbolKind::Method);
+            let new_static = symbol.modifiers.iter().any(|m| m == "static");
+            let old_static = existing.modifiers.iter().any(|m| m == "static");
+            let is_overload = both_methods && new_static != old_static;
+            if !is_overload {
+                return Err(format!(
+                    "Symbol '{}' already defined in current scope at line {}",
+                    name, existing.span.start.line
+                ));
+            }
         }
 
         // Add to current scope
@@ -1134,6 +1143,34 @@ class MyClass
 
         // Verify class is registered
         assert!(analyzer.symbol_table.lookup("MyClass").is_some());
+    }
+
+    #[test]
+    fn test_static_instance_overload_not_duplicate() {
+        // Static and instance methods may share a name in Enforce (different
+        // namespaces) — must not be reported as "already defined".
+        let code = r#"
+class MyClass
+{
+    bool Load()
+    {
+        return true;
+    }
+    static bool Load()
+    {
+        return false;
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        assert!(!analyzer.errors.iter().any(|e| e.contains("already defined")));
     }
 
     #[test]
