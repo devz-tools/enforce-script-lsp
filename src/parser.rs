@@ -563,6 +563,7 @@ impl Parser {
             && let TokenType::Identifier(first_name) = &token.token_type
         {
             let first_name_clone = first_name.clone();
+            let field_start = Position::from_token(token);
             self.advance();
 
             // Check what comes after the identifier
@@ -573,7 +574,8 @@ impl Parser {
                 if is_array_field {
                     self.consume(&TokenType::RightBracket, "Expected ']' after '['")?;
                 }
-                let field = self.parse_field_rest(modifiers, TypeRef::Auto, first_name_clone)?;
+                let field =
+                    self.parse_field_rest(modifiers, TypeRef::Auto, first_name_clone, field_start)?;
                 return Ok((vec![], vec![field]));
             }
 
@@ -584,6 +586,7 @@ impl Parser {
         }
 
         // Standard Enforce Script: type name = value; or type name(...) { }
+        let start = Position::from_token(self.current());
         let type_ref = self.parse_type()?;
         let name = self.consume_identifier("Expected member name")?;
 
@@ -592,11 +595,11 @@ impl Parser {
 
         // Check if it's a method (has parentheses)
         if self.check(&TokenType::LeftParen) {
-            let method = self.parse_method_rest(modifiers, type_ref, name)?;
+            let method = self.parse_method_rest(modifiers, type_ref, name, start)?;
             Ok((vec![method], vec![]))
         } else {
             // It's a field
-            let field = self.parse_field_rest(modifiers, type_ref, name)?;
+            let field = self.parse_field_rest(modifiers, type_ref, name, start)?;
             Ok((vec![], vec![field]))
         }
     }
@@ -606,9 +609,8 @@ impl Parser {
         modifiers: Vec<String>,
         return_type: TypeRef,
         name: String,
+        start: Position,
     ) -> Result<Method, String> {
-        let start = Position::new(0, 0, 0); // TODO: Track properly
-
         self.consume(&TokenType::LeftParen, "Expected '('")?;
 
         let parameters = if !self.check(&TokenType::RightParen) {
@@ -619,16 +621,20 @@ impl Parser {
 
         self.consume(&TokenType::RightParen, "Expected ')'")?;
 
-        // Check for body
-        let body = if self.check(&TokenType::LeftBrace) {
-            Some(self.parse_block()?)
-        } else if self.match_token(&[TokenType::Semicolon]) {
-            None // Proto/native method
+        // Determine the body and the declaration's end position. Capture the end
+        // from the token we actually consume (not `previous()`, which can point
+        // at a following comment after `advance()` skips comments).
+        let (body, end) = if self.check(&TokenType::LeftBrace) {
+            let body = self.parse_block()?;
+            (Some(body), Position::from_token(self.previous().unwrap()))
+        } else if self.check(&TokenType::Semicolon) {
+            let end = Position::from_token(self.current());
+            self.advance();
+            (None, end)
         } else {
             return Err("Expected '{' or ';' after method declaration".to_string());
         };
 
-        let end = Position::from_token(self.previous().unwrap());
         let span = Span::new(start, end);
 
         Ok(Method {
@@ -646,21 +652,22 @@ impl Parser {
         modifiers: Vec<String>,
         type_ref: TypeRef,
         name: String,
+        start: Position,
     ) -> Result<Field, String> {
-        let start = Position::new(0, 0, 0); // TODO: Track properly
-
         let initializer = if self.match_token(&[TokenType::Assign]) {
             Some(self.parse_expression()?)
         } else {
             None
         };
 
+        // Capture the ';' position explicitly (not `previous()`, which `advance()`
+        // may move past a following comment).
+        let end = Position::from_token(self.current());
         self.consume(
             &TokenType::Semicolon,
             "Expected ';' after field declaration",
         )?;
 
-        let end = Position::from_token(self.previous().unwrap());
         let span = Span::new(start, end);
 
         Ok(Field {
@@ -758,16 +765,17 @@ impl Parser {
     }
 
     fn parse_function_or_global(&mut self, modifiers: Vec<String>) -> Result<Declaration, String> {
+        let start = Position::from_token(self.current());
         let type_ref = self.parse_type()?;
         let name = self.consume_identifier("Expected function or variable name")?;
 
         // A following '(' marks a function; otherwise it's a module-level variable
         // (e.g. `static const string DM_BOTORAMA_VERSION = "3.521";`).
         if self.check(&TokenType::LeftParen) {
-            let method = self.parse_method_rest(modifiers, type_ref, name)?;
+            let method = self.parse_method_rest(modifiers, type_ref, name, start)?;
             Ok(Declaration::Function(Box::new(method)))
         } else {
-            let field = self.parse_field_rest(modifiers, type_ref, name)?;
+            let field = self.parse_field_rest(modifiers, type_ref, name, start)?;
             Ok(Declaration::Variable(field))
         }
     }
