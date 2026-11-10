@@ -41,14 +41,14 @@ did_open(file)
 ### `Workspace` (workspace.rs)
 Discovers every `config.cpp` under the project root, parses `dir`/`files[]`/`defines[]`, and
 builds:
-- `prefix_map`: `files[]` prefix (`dm_cons`) → directory of the declaring `config.cpp`.
+- `prefix_map`: `files[]` prefix (`my_mod`) → directory of the declaring `config.cpp`.
 - `compiled_dirs`: absolute paths that actually enter compilation.
-- `dependency_roots`: extra roots (vanilla/Expansion) indexed "lightly" (all `.c`, no config).
+- `dependency_roots`: extra roots (e.g. the vanilla engine scripts) indexed "lightly" (all `.c`, no config).
 - `defines_for(path)`: walk up to the nearest `config.cpp`, return its `defines[]`.
 - `is_compiled(path)`: is the file under a compiled directory?
 
-Handles **two config.cpp styles**: prefix (`dm_cons/3_Game`) and full-path
-(`DayZExpansion/Core/Scripts/3_Game`). See the plan for the layer/`modded class` model.
+Handles **two config.cpp styles**: prefix (`my_mod/3_Game`) and full-path
+(`SomeMod/Core/Scripts/3_Game`). See the plan for the layer/`modded class` model.
 
 ### `SymbolIndex` (index.rs)
 `name → Vec<IndexedSymbol{uri, symbol}>` + `class_parents`. Built by walking compiled dirs +
@@ -65,8 +65,8 @@ Cross-file resolution state passed to the per-file `SemanticAnalyzer`:
 - `class_members`: `class → set of member names`.
 - `has_member(class, name)`: walk the ancestry chain.
 
-This is what removes `undefined identifier` for inherited fields (`m_Concurrency`) and global
-enums (`dmBotIntentConcurrency`).
+This is what removes `undefined identifier` for inherited fields (`m_SomeField`) and global
+enums (`MyIntentConcurrency`).
 
 ### Preprocessor (lexer.rs)
 `#ifdef X` / `#ifndef X` / `#else` / `#endif` evaluated against the module's active defines
@@ -74,9 +74,15 @@ enums (`dmBotIntentConcurrency`).
 skip all `#ifdef`** (the default when no `config.cpp` is known, e.g. vanilla files).
 
 ### Lint (lint.rs)
-Enforce-specific checks with thresholds in `LintConfig` (currently defaults from botorama's
-`codeguide.md`): long `+` chain (>6), long `||`/`&&` chain (>8), ternary (forbidden), line
-break after `.` (forbidden). Each finding is a `LintIssue { message, line, is_error }`.
+Enforce-specific checks with thresholds in `LintConfig` (tuned to Enforce engine limits): long
+`+` chain (>15), long `||`/`&&` chain (>8), ternary (forbidden), line break after `.`
+(forbidden), duplicate variable declaration in a method (Enforce has no block scope),
+field/variable shadowing a built-in class name. Each finding is a
+`LintIssue { message, line, is_error }`.
+
+Note: **bitwise operators (`&` `|` `~` `<<` `>>`) ARE supported in Enforce** — there is no
+bitwise lint. An early version flagged them on the (wrong) assumption they give
+`Unknown operator`; verified against real-world code that they are supported.
 
 ## Conventions
 
@@ -87,6 +93,15 @@ break after `.` (forbidden). Each finding is a `LintIssue { message, line, is_er
 - `Symbol` carries `parent: Option<String>`: `None` = global, `Some(class)` = member. The
   `environment()` split relies on this.
 - Config is read from `initializationOptions` in `initialize` (currently `dependencyRoots`).
+- **The parser is validated against real-world DayZ codebases** (the vanilla engine scripts
+  plus a large mod tree). New syntax must not regress `cargo test` (147 tests) nor
+  re-introduce parse errors on real code. Key patterns already covered: `[attr]` registration
+  attributes, nested generics (`map<string, ref array<int>>`), primitive types as
+  objects/values (`string.Empty`, `!= int`), `Type name();` default-construction,
+  multi-variable declarations, generic base classes (`class X: array<T>`),
+  `(ClassName)expr`/`(Type){...}` casts, `.!` negated member access, compound assignment
+  (`^=`), `reference`/`event`/`local`/`sealed` modifiers, trailing commas, and the `default`
+  soft keyword.
 
 ## Extending
 
@@ -100,6 +115,14 @@ break after `.` (forbidden). Each finding is a `LintIssue { message, line, is_er
 ```bash
 cargo test
 ```
+
+## Operational notes
+
+- **After deploying the binary (`cp … .new && mv`), restart the running server process.** `mv`
+  swaps the path to a new inode, but an already-running process keeps the old inode in memory.
+  `pkill -f 'enforce-script-lsp --stdio'` — OpenCode relaunches it lazily. Verify with
+  `ls -li /proc/<PID>/exe`: a `(deleted)` suffix means stale. Symptoms of a stale server: recent
+  fixes don't show up.
 
 ## Housekeeping
 
