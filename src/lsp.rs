@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 /// LSP Server implementation for Enforce Script
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -8,10 +9,12 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use crate::lexer::Lexer;
 use crate::parser::{Class, Declaration, Parser, Program};
 use crate::semantic::{SemanticAnalyzer, SymbolKind, SymbolTable};
+use crate::workspace::Workspace;
 
 pub struct Backend {
     client: Client,
     documents: Arc<DashMap<String, DocumentData>>,
+    workspace: Arc<RwLock<Option<Workspace>>>,
 }
 
 struct DocumentData {
@@ -27,6 +30,7 @@ impl Backend {
         Backend {
             client,
             documents: Arc::new(DashMap::new()),
+            workspace: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -89,6 +93,24 @@ impl Backend {
                 diagnostics: diagnostics.clone(),
             },
         );
+
+        // Warn when a script file is not under any compiled directory (config.cpp files[]).
+        if let Some(ws) = self.workspace.read().unwrap().as_ref() {
+            if let Ok(url) = Url::parse(uri) {
+                if let Ok(path) = url.to_file_path() {
+                    let is_config =
+                        path.file_name().and_then(|n| n.to_str()) == Some("config.cpp");
+                    let is_script = path.extension().and_then(|e| e.to_str()) == Some("c");
+                    if is_script && !is_config && !ws.is_compiled(&path) {
+                        diagnostics.push(create_diagnostic(
+                            "File is not included in any module's files[] — excluded from compilation"
+                                .to_string(),
+                            DiagnosticSeverity::WARNING,
+                        ));
+                    }
+                }
+            }
+        }
 
         // Publish diagnostics
         let uri_parsed = Url::parse(uri).unwrap_or_else(|_| Url::parse("file:///unknown").unwrap());
@@ -423,7 +445,15 @@ fn find_symbol_at_position(text: &str, position: Position) -> Option<String> {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Discover config.cpp files and build the workspace model from rootUri.
+        if let Some(uri) = params.root_uri {
+            if let Ok(root) = uri.to_file_path() {
+                let workspace = Workspace::build(&root);
+                *self.workspace.write().unwrap() = Some(workspace);
+            }
+        }
+
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "enforce-script-lsp".to_string(),
