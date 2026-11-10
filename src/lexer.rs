@@ -517,6 +517,8 @@ impl Lexer {
             "super" => TokenType::Super,
             "return" => TokenType::Return,
             "null" => TokenType::Null,
+            // DayZ also uses the uppercase `NULL` as a null literal.
+            "NULL" => TokenType::Null,
             "true" => TokenType::True,
             "false" => TokenType::False,
             "thread" => TokenType::Thread,

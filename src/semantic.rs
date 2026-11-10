@@ -63,16 +63,13 @@ impl SymbolTable {
     pub fn define(&mut self, symbol: Symbol) -> Result<(), String> {
         let name = symbol.name.clone();
 
-        // Check for duplicate in current scope
+        // Check for duplicate in current scope. Method overloading (same name,
+        // different parameters — or static vs instance) is legal in Enforce, so
+        // same-named methods are not duplicates.
         if let Some(existing) = self.scopes[self.current_scope].get(&name) {
-            // Static vs instance method overload is legal in Enforce (different
-            // namespaces), so don't flag it as a duplicate.
             let both_methods = matches!(symbol.kind, SymbolKind::Method)
                 && matches!(existing.kind, SymbolKind::Method);
-            let new_static = symbol.modifiers.iter().any(|m| m == "static");
-            let old_static = existing.modifiers.iter().any(|m| m == "static");
-            let is_overload = both_methods && new_static != old_static;
-            if !is_overload {
+            if !both_methods {
                 return Err(format!(
                     "Symbol '{}' already defined in current scope at line {}",
                     name, existing.span.start.line
