@@ -9,6 +9,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::lexer::Lexer;
 use crate::index::SymbolIndex;
+use crate::lint::{lint, LintConfig, LintIssue};
 use crate::parser::{Class, Declaration, Parser, Program};
 use crate::semantic::{SemanticAnalyzer, SymbolKind, SymbolTable};
 use crate::workspace::Workspace;
@@ -56,6 +57,7 @@ impl Backend {
         let mut lexer = Lexer::new(text);
         lexer.set_active_defines(&defines);
         let tokens = lexer.tokenize();
+        let tokens_for_lint = tokens.clone();
 
         let mut diagnostics = Vec::new();
 
@@ -106,6 +108,13 @@ impl Backend {
         } else {
             None
         };
+
+        // Enforce-specific lint checks (chained operators, line break after '.', ...).
+        if let Some(ref prog) = program {
+            for issue in lint(prog, &tokens_for_lint, &LintConfig::default()) {
+                diagnostics.push(lint_issue_to_diagnostic(issue));
+            }
+        }
 
         self.documents.insert(
             uri.to_string(),
@@ -420,6 +429,26 @@ fn symbol_to_hover(symbol: &crate::semantic::Symbol) -> Hover {
             value,
         }),
         range: Some(span_to_range(&symbol.span)),
+    }
+}
+
+/// Convert a lint issue to an LSP diagnostic.
+fn lint_issue_to_diagnostic(issue: LintIssue) -> Diagnostic {
+    let line = issue.line.saturating_sub(1) as u32;
+    Diagnostic {
+        range: Range::new(Position::new(line, 0), Position::new(line, 100)),
+        severity: Some(if issue.is_error {
+            DiagnosticSeverity::ERROR
+        } else {
+            DiagnosticSeverity::WARNING
+        }),
+        code: None,
+        code_description: None,
+        source: Some("enforce-script-lsp (lint)".to_string()),
+        message: issue.message,
+        related_information: None,
+        tags: None,
+        data: None,
     }
 }
 

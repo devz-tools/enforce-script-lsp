@@ -1,5 +1,6 @@
 mod index;
 mod lexer;
+mod lint;
 mod lsp;
 mod parser;
 mod semantic;
