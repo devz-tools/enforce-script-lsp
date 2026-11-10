@@ -1659,6 +1659,34 @@ impl Parser {
         }
 
         if self.match_token(&[TokenType::LeftParen]) {
+            // C-style cast `(type)expr` — a primitive type keyword right after '('.
+            let is_cast = matches!(
+                self.current_opt().map(|t| &t.token_type),
+                Some(
+                    TokenType::Void
+                        | TokenType::Int
+                        | TokenType::Float
+                        | TokenType::Bool
+                        | TokenType::String
+                        | TokenType::Vector
+                        | TokenType::Typename
+                        | TokenType::Auto
+                )
+            );
+            if is_cast {
+                let start = Position::from_token(self.previous().unwrap());
+                let type_ref = self.parse_type()?;
+                self.consume(&TokenType::RightParen, "Expected ')' after cast type")?;
+                let expression = self.parse_unary()?;
+                let end = Position::from_token(self.previous().unwrap());
+                let span = Span::new(start, end);
+                return Ok(Expression::Cast {
+                    type_ref,
+                    expression: Box::new(expression),
+                    span,
+                });
+            }
+
             let expr = self.parse_expression()?;
             self.consume(&TokenType::RightParen, "Expected ')'")?;
             return Ok(expr);
@@ -1871,6 +1899,28 @@ void Test()
         let result = parser.parse();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_c_style_cast() {
+        let code = r#"
+void Test()
+{
+    int ticks = 5;
+    if ((float)ticks > 10.0)
+    {
+        int a = (int)3.5;
+        bool b = (bool)0;
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_ok());
+        assert!(parser.get_errors().is_empty());
     }
 
     #[test]
