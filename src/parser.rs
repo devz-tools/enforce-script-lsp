@@ -56,6 +56,47 @@ pub enum TypeRef {
     Auto,                               // auto
 }
 
+/// Base name of a type reference: `array<EffectArea>` → `array`, `int` → `int`.
+fn type_ref_base_name(t: &TypeRef) -> String {
+    match t {
+        TypeRef::Primitive(n) => n.clone(),
+        TypeRef::Class(n) => n.clone(),
+        TypeRef::Template(n, _) => n.clone(),
+        TypeRef::Array(inner, _) => type_ref_base_name(inner),
+        TypeRef::Auto => "auto".to_string(),
+    }
+}
+
+/// Whether a token can begin an expression (a value), as opposed to an operator
+/// or delimiter. Used to disambiguate `(ClassName)expr` casts from parenthesized
+/// expressions like `(value) & 255`.
+fn token_starts_expression(t: &TokenType) -> bool {
+    matches!(
+        t,
+        TokenType::Identifier(_)
+            | TokenType::IntLiteral(_)
+            | TokenType::FloatLiteral(_)
+            | TokenType::StringLiteral(_)
+            | TokenType::New
+            | TokenType::LeftParen
+            | TokenType::LeftBrace
+            | TokenType::This
+            | TokenType::Super
+            | TokenType::Null
+            | TokenType::True
+            | TokenType::False
+            | TokenType::Minus
+            | TokenType::Not
+            | TokenType::BitwiseNot
+            | TokenType::Int
+            | TokenType::Float
+            | TokenType::Bool
+            | TokenType::String
+            | TokenType::Vector
+            | TokenType::Typename
+    )
+}
+
 /// Function parameter - default_value will be used for completion/signature help in LSP
 #[derive(Debug, Clone)]
 pub struct Parameter {
@@ -346,6 +387,14 @@ impl Parser {
     }
 
     fn parse_declaration(&mut self) -> Result<Declaration, String> {
+        // Skip modded registration attributes `[ClassName(...)]` before a
+        // declaration (CF/Expansion framework registration syntax).
+        while self.check(&TokenType::LeftBracket) {
+            self.skip_bracketed_group();
+            // A stray `;` after the attribute (`[attr];`).
+            self.match_token(&[TokenType::Semicolon]);
+        }
+
         let mut modifiers = Vec::new();
 
         // Parse modifiers
@@ -394,7 +443,9 @@ impl Parser {
         // Parse extends
         let extends =
             if self.match_token(&[TokenType::Colon]) || self.match_token(&[TokenType::Extends]) {
-                Some(self.consume_identifier("Expected base class name")?)
+                // The base can be a generic type: `class X : array<EffectArea>`.
+                let base_type = self.parse_type()?;
+                Some(type_ref_base_name(&base_type))
             } else {
                 None
             };
@@ -540,6 +591,13 @@ impl Parser {
     }
 
     fn parse_class_member(&mut self) -> Result<(Vec<Method>, Vec<Field>), String> {
+        // Skip `[attr]` before a member (e.g. `[NonSerialized()] private bool x;`).
+        while self.check(&TokenType::LeftBracket) {
+            self.skip_bracketed_group();
+            // A stray `;` after the attribute (`[NonSerialized()];`).
+            self.match_token(&[TokenType::Semicolon]);
+        }
+
         let mut modifiers = Vec::new();
 
         // Parse modifiers
@@ -636,7 +694,10 @@ impl Parser {
         // at a following comment after `advance()` skips comments).
         let (body, end) = if self.check(&TokenType::LeftBrace) {
             let body = self.parse_block()?;
-            (Some(body), Position::from_token(self.previous().unwrap()))
+            let end = Position::from_token(self.previous().unwrap());
+            // Optional trailing `;` after an empty method body (`bool Send() {};`).
+            self.match_token(&[TokenType::Semicolon]);
+            (Some(body), end)
         } else if self.check(&TokenType::Semicolon) {
             let end = Position::from_token(self.current());
             self.advance();
@@ -854,7 +915,7 @@ impl Parser {
             // `notnull`, `obsolete`).
             if let Some(token) = self.current_opt()
                 && let TokenType::Identifier(name) = &token.token_type
-                && matches!(name.as_str(), "volatile" | "owned" | "notnull" | "obsolete")
+                && matches!(name.as_str(), "volatile" | "owned" | "notnull" | "obsolete" | "reference" | "event" | "local" | "sealed")
             {
                 modifiers.push(name.clone());
                 self.advance();
@@ -960,6 +1021,16 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Statement, String> {
+        // Empty statement: a lone `;` (e.g. a stray `;;` after a statement).
+        if self.check(&TokenType::Semicolon) {
+            let pos = Position::from_token(self.current());
+            self.advance();
+            return Ok(Statement::Block {
+                statements: Vec::new(),
+                span: Span::new(pos.clone(), pos),
+            });
+        }
+
         if self.match_token(&[TokenType::If]) {
             self.parse_if_statement()
         } else if self.match_token(&[TokenType::Switch]) {
@@ -1016,11 +1087,27 @@ impl Parser {
             // Array variable: `float arr[4];`
             self.consume_array_brackets()?;
 
+            // Default-constructor call: `Type name();`
+            // (e.g. `array<ref RaycastRVResult> results();`).
+            if self.check(&TokenType::LeftParen) && self.next_is(&TokenType::RightParen) {
+                self.advance(); // '('
+                self.advance(); // ')'
+            }
+
             let initializer = if self.match_token(&[TokenType::Assign]) {
                 Some(self.parse_expression()?)
             } else {
                 None
             };
+
+            // Multi-variable declaration: `vector a, b, c;` — consume the extra
+            // names (each with an optional initializer).
+            while self.match_token(&[TokenType::Comma]) {
+                self.consume_identifier("Expected variable name")?;
+                if self.match_token(&[TokenType::Assign]) {
+                    self.parse_expression()?;
+                }
+            }
 
             self.consume(&TokenType::Semicolon, "Expected ';'")?;
             let end = Position::from_token(self.previous().unwrap());
@@ -1401,6 +1488,7 @@ impl Parser {
             TokenType::SlashAssign,
             TokenType::OrAssign,
             TokenType::AndAssign,
+            TokenType::XorAssign,
             TokenType::LeftShiftAssign,
             TokenType::RightShiftAssign,
         ]) {
@@ -1667,16 +1755,24 @@ impl Parser {
                     span,
                 };
             } else if self.match_token(&[TokenType::Dot]) {
+                // `.!` — a negated member access: `obj.!Method()` == `!obj.Method()`.
+                let negate = self.match_token(&[TokenType::Not]);
                 let member = self.consume_identifier("Expected member name")?;
-                let span = Span::new(
-                    expr.span().start.clone(),
-                    Position::from_token(self.previous().unwrap()),
-                );
-                expr = Expression::MemberAccess {
+                let start = expr.span().start.clone();
+                let end = Position::from_token(self.previous().unwrap());
+                let mut result = Expression::MemberAccess {
                     object: Box::new(expr),
                     member,
-                    span,
+                    span: Span::new(start.clone(), end.clone()),
                 };
+                if negate {
+                    result = Expression::Unary {
+                        operator: "!".to_string(),
+                        operand: Box::new(result),
+                        span: Span::new(start, end),
+                    };
+                }
+                expr = result;
             } else if self.match_token(&[TokenType::LeftBracket]) {
                 let index = Box::new(self.parse_expression()?);
                 let end_line = self.current().line;
@@ -1719,6 +1815,10 @@ impl Parser {
                 arguments.push(self.parse_expression()?);
 
                 if !self.match_token(&[TokenType::Comma]) {
+                    break;
+                }
+                // Trailing comma: `f(a, b,)` — break if `)` follows.
+                if self.check(&TokenType::RightParen) {
                     break;
                 }
             }
@@ -1792,6 +1892,30 @@ impl Parser {
                     self.advance();
                     return Ok(Expression::Identifier(identifier, span));
                 }
+                // A primitive type keyword used as a value (a `typename` object):
+                // `x.GetVariableType(i) != int`, `== float`, etc.
+                TokenType::Int
+                | TokenType::Float
+                | TokenType::Bool
+                | TokenType::String
+                | TokenType::Vector
+                | TokenType::Typename
+                | TokenType::Default => {
+                    let name = match &token.token_type {
+                        TokenType::Int => "int",
+                        TokenType::Float => "float",
+                        TokenType::Bool => "bool",
+                        TokenType::String => "string",
+                        TokenType::Vector => "vector",
+                        TokenType::Typename => "typename",
+                        TokenType::Default => "default",
+                        _ => unreachable!(),
+                    }
+                    .to_string();
+                    let span = Span::from_token(token);
+                    self.advance();
+                    return Ok(Expression::Identifier(name, span));
+                }
                 _ => {}
             }
         }
@@ -1819,9 +1943,8 @@ impl Parser {
         }
 
         if self.match_token(&[TokenType::LeftParen]) {
-            // C-style cast `(type)expr` — a primitive type keyword right after '('.
-            let is_cast = matches!(
-                self.current_opt().map(|t| &t.token_type),
+            // C-style cast `(type)expr` — a type keyword or `(ClassName)` right after '('.
+            let is_cast = match self.current_opt().map(|t| &t.token_type) {
                 Some(
                     TokenType::Void
                         | TokenType::Int
@@ -1830,9 +1953,13 @@ impl Parser {
                         | TokenType::String
                         | TokenType::Vector
                         | TokenType::Typename
-                        | TokenType::Auto
-                )
-            );
+                        | TokenType::Auto,
+                ) => true,
+                // `(ClassName)expr` cast — an identifier immediately followed by `)`
+                // and then an expression (not an operator).
+                Some(TokenType::Identifier(_)) => self.identifier_is_cast_type(),
+                _ => false,
+            };
             if is_cast {
                 let start = Position::from_token(self.previous().unwrap());
                 let type_ref = self.parse_type()?;
@@ -1936,6 +2063,35 @@ impl Parser {
         }
     }
 
+    /// Whether the token after the current one (skipping comments) matches `token_type`.
+    fn next_is(&self, token_type: &TokenType) -> bool {
+        let mut i = self.position + 1;
+        while i < self.tokens.len() && matches!(self.tokens[i].token_type, TokenType::Comment(_)) {
+            i += 1;
+        }
+        i < self.tokens.len()
+            && std::mem::discriminant(&self.tokens[i].token_type)
+                == std::mem::discriminant(token_type)
+    }
+
+    /// Whether the current identifier begins a `(ClassName)expr` cast: it must be
+    /// immediately followed by `)`, and the token after `)` must start an
+    /// expression (so `(Object)crash` is a cast but `(value) & 255` is not).
+    fn identifier_is_cast_type(&self) -> bool {
+        if !self.next_is(&TokenType::RightParen) {
+            return false;
+        }
+        let mut i = self.position + 1; // the `)`
+        while i < self.tokens.len() && matches!(self.tokens[i].token_type, TokenType::Comment(_)) {
+            i += 1;
+        }
+        i += 1; // past `)`
+        while i < self.tokens.len() && matches!(self.tokens[i].token_type, TokenType::Comment(_)) {
+            i += 1;
+        }
+        i < self.tokens.len() && token_starts_expression(&self.tokens[i].token_type)
+    }
+
     fn match_token(&mut self, types: &[TokenType]) -> bool {
         for token_type in types {
             if self.check(token_type) {
@@ -1952,6 +2108,29 @@ impl Parser {
             Ok(())
         } else {
             Err(format!("{} at line {}", message, self.current().line))
+        }
+    }
+
+    /// Skip a `[...]` group (used for `[ClassName(...)]` registration attributes),
+    /// handling nested brackets. Assumes the current token is `[`.
+    fn skip_bracketed_group(&mut self) {
+        let mut depth = 0;
+        loop {
+            match self.current_opt() {
+                None => return,
+                Some(t) => match t.token_type {
+                    TokenType::LeftBracket => depth += 1,
+                    TokenType::RightBracket => {
+                        depth -= 1;
+                        if depth == 0 {
+                            self.advance();
+                            return;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            self.advance();
         }
     }
 
@@ -1987,12 +2166,21 @@ impl Parser {
     }
 
     fn consume_identifier(&mut self, message: &str) -> Result<String, String> {
-        if let Some(token) = self.current_opt()
-            && let TokenType::Identifier(name) = &token.token_type
-        {
-            let result = name.clone();
-            self.advance();
-            return Ok(result);
+        if let Some(token) = self.current_opt() {
+            match &token.token_type {
+                TokenType::Identifier(name) => {
+                    let result = name.clone();
+                    self.advance();
+                    return Ok(result);
+                }
+                // `default` is a soft keyword — usable as a parameter/variable name
+                // (e.g. `void F(float default = 0)`).
+                TokenType::Default => {
+                    self.advance();
+                    return Ok("default".to_string());
+                }
+                _ => {}
+            }
         }
         Err(format!("{} at line {}", message, self.current().line))
     }
@@ -2496,6 +2684,52 @@ class dmCampCoverFinder
         let result = parser.parse();
 
         assert!(result.is_ok(), "nested generics parse error: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_registration_attribute() {
+        let code = r#"
+[eAIRegisterFaction(eAIFactionCivilian)]
+class eAIFactionCivilian : eAIFaction
+{
+	[NonSerialized()];
+	private int m_Index;
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        assert!(parser.parse().is_ok(), "{:?}", parser.get_errors());
+    }
+
+    #[test]
+    fn test_parse_generic_extends() {
+        let code = r#"
+class Expansion_EffectAreas: array<EffectArea>
+{
+	int Count() { return 0; }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        assert!(parser.parse().is_ok(), "{:?}", parser.get_errors());
+    }
+
+    #[test]
+    fn test_parse_primitive_member_access() {
+        let code = r#"
+void F()
+{
+	if (m_X != string.Empty)
+		return;
+	float m = float.MAX;
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        assert!(parser.parse().is_ok(), "{:?}", parser.get_errors());
     }
 
     #[test]

@@ -65,6 +65,7 @@ pub enum TokenType {
     SlashAssign,
     OrAssign,
     AndAssign,
+    XorAssign,
     LeftShiftAssign,
     RightShiftAssign,
     Increment,
@@ -483,9 +484,23 @@ impl Lexer {
             "enum" => TokenType::Enum,
             "typedef" => TokenType::Typedef,
             "void" => TokenType::Void,
+            "int" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "int" => TokenType::Int,
+            "float" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "float" => TokenType::Float,
+            "bool" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "bool" => TokenType::Bool,
+            // `string` is both a primitive type and a global object with static
+            // members (e.g. `string.Empty`) — same rule as `vector` below.
+            "string" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "string" => TokenType::String,
             // `vector` is both a primitive type and a global object (e.g. `vector.Distance`).
             // When immediately followed by '.', it's the object — emit an identifier.
@@ -668,7 +683,14 @@ impl Lexer {
                     TokenType::BitwiseOr
                 }
             }
-            '^' => TokenType::BitwiseXor,
+            '^' => {
+                if !self.is_at_end() && self.current_char() == '=' {
+                    self.advance();
+                    TokenType::XorAssign
+                } else {
+                    TokenType::BitwiseXor
+                }
+            }
             '?' => TokenType::Question,
             _ => TokenType::Unknown(ch),
         };
