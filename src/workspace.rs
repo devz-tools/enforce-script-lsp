@@ -79,6 +79,9 @@ fn split_prefix(entry: &str) -> (&str, &str) {
 pub struct Workspace {
     #[allow(dead_code)] // used for dependency/vanilla roots (later steps)
     pub root: PathBuf,
+    /// Extra source roots to index "лайтово" (vanilla, Expansion, ...): all `.c`
+    /// files under them, regardless of config.cpp.
+    pub dependency_roots: Vec<PathBuf>,
     #[allow(dead_code)] // used for per-module defines/index (later steps)
     pub configs: Vec<ModuleConfig>,
     /// `files[]` prefix → directory of the `config.cpp` that declared it.
@@ -90,7 +93,8 @@ pub struct Workspace {
 
 impl Workspace {
     /// Discover every `config.cpp` under `root` and build the workspace model.
-    pub fn build(root: &Path) -> Workspace {
+    /// `dependency_roots` are extra roots (vanilla/Expansion) indexed separately.
+    pub fn build(root: &Path, dependency_roots: Vec<PathBuf>) -> Workspace {
         let mut configs = Vec::new();
         for path in discover_config_files(root) {
             if let Ok(text) = std::fs::read_to_string(&path) {
@@ -133,6 +137,7 @@ impl Workspace {
 
         Workspace {
             root: root.to_path_buf(),
+            dependency_roots,
             configs,
             prefix_map,
             compiled_dirs,
@@ -273,7 +278,7 @@ class CfgMods
         )
         .unwrap();
 
-        let ws = Workspace::build(&root);
+        let ws = Workspace::build(&root, Vec::new());
         assert_eq!(ws.configs.len(), 1);
         assert!(ws.is_compiled(&root.join("src/cons/3_Game/foo.c")));
         assert!(ws.is_compiled(&root.join("src/cons/4_World/bar.c")));

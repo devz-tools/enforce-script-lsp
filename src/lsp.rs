@@ -452,6 +452,20 @@ fn lint_issue_to_diagnostic(issue: LintIssue) -> Diagnostic {
     }
 }
 
+/// Extract dependency roots (vanilla/Expansion dirs) from initializationOptions.
+fn extract_dependency_roots(opts: &Option<serde_json::Value>) -> Vec<std::path::PathBuf> {
+    opts.as_ref()
+        .and_then(|v| v.get("dependencyRoots"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str())
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Extract line number from error message (format: "... at line N")
 fn extract_line_from_error(message: &str) -> Option<usize> {
     if let Some(idx) = message.rfind("at line ") {
@@ -538,7 +552,8 @@ impl LanguageServer for Backend {
         // Discover config.cpp files and build the workspace model from rootUri.
         if let Some(uri) = params.root_uri {
             if let Ok(root) = uri.to_file_path() {
-                let workspace = Workspace::build(&root);
+                let dependency_roots = extract_dependency_roots(&params.initialization_options);
+                let workspace = Workspace::build(&root, dependency_roots);
                 *self.workspace.write().unwrap() = Some(workspace);
             }
         }

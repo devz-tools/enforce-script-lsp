@@ -328,7 +328,6 @@ impl Parser {
                 Ok(decl) => declarations.push(decl),
                 Err(e) => {
                     // Error recovery: skip to next likely declaration start
-                    eprintln!("Parse error: {}", e);
                     self.errors.push(e);
                     self.synchronize();
                 }
@@ -424,7 +423,6 @@ impl Parser {
                     fields.extend(member_fields);
                 }
                 Err(e) => {
-                    eprintln!("Error parsing class member: {}", e);
                     self.errors.push(e);
                     self.synchronize();
                 }
@@ -847,7 +845,6 @@ impl Parser {
             match self.parse_statement() {
                 Ok(stmt) => statements.push(stmt),
                 Err(e) => {
-                    eprintln!("Error parsing statement: {}", e);
                     self.errors.push(e);
                     self.synchronize();
                 }

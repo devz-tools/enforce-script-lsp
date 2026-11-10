@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::lexer::Lexer;
-use crate::parser::{Declaration, Parser};
-use crate::semantic::{GlobalEnvironment, SemanticAnalyzer, Symbol};
+use crate::parser::{Declaration, Parser, TypeRef};
+use crate::semantic::{GlobalEnvironment, Symbol, SymbolKind};
 use crate::workspace::Workspace;
 
 /// A symbol occurrence together with its defining file.
@@ -22,13 +22,27 @@ pub struct SymbolIndex {
 }
 
 impl SymbolIndex {
-    /// Parse every compiled `.c` file and collect its symbols.
+    /// Parse every compiled `.c` file (project + dependency roots) and collect
+    /// its symbols ("лайтово": signatures straight from the AST, no semantic pass).
     pub fn build(workspace: &Workspace) -> SymbolIndex {
         let mut index = SymbolIndex::default();
         for dir in &workspace.compiled_dirs {
             index_dir(dir, workspace, &mut index);
         }
+        for root in &workspace.dependency_roots {
+            index_dir(root, workspace, &mut index);
+        }
         index
+    }
+
+    fn insert(&mut self, uri: &str, symbol: Symbol) {
+        self.by_name
+            .entry(symbol.name.clone())
+            .or_default()
+            .push(IndexedSymbol {
+                uri: uri.to_string(),
+                symbol,
+            });
     }
 
     pub fn lookup(&self, name: &str) -> &[IndexedSymbol] {
@@ -87,31 +101,124 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
         return;
     };
 
-    // Record the class hierarchy (`class X : Parent`).
-    for decl in &program.declarations {
-        if let Declaration::Class(class) = decl {
-            index
-                .class_parents
-                .insert(class.name.clone(), class.extends.clone());
-        }
-    }
-
-    let mut analyzer = SemanticAnalyzer::new();
-    let _ = analyzer.analyze(&program);
-
     let uri = format!("file://{}", path.display());
-    for symbol in analyzer.get_symbol_table().get_all_symbols() {
-        // Only top-level symbols and class members (scope 0); skip locals/params.
-        if symbol.scope != 0 {
-            continue;
+    for decl in &program.declarations {
+        match decl {
+            Declaration::Class(class) => {
+                index
+                    .class_parents
+                    .insert(class.name.clone(), class.extends.clone());
+                index.insert(
+                    &uri,
+                    Symbol {
+                        name: class.name.clone(),
+                        kind: SymbolKind::Class,
+                        type_ref: Some(TypeRef::Class(class.name.clone())),
+                        span: class.span.clone(),
+                        scope: 0,
+                        modifiers: class.modifiers.clone(),
+                        parent: None,
+                    },
+                );
+                for field in &class.fields {
+                    index.insert(
+                        &uri,
+                        Symbol {
+                            name: field.name.clone(),
+                            kind: SymbolKind::Field,
+                            type_ref: Some(field.type_ref.clone()),
+                            span: field.span.clone(),
+                            scope: 0,
+                            modifiers: field.modifiers.clone(),
+                            parent: Some(class.name.clone()),
+                        },
+                    );
+                }
+                for method in &class.methods {
+                    index.insert(
+                        &uri,
+                        Symbol {
+                            name: method.name.clone(),
+                            kind: SymbolKind::Method,
+                            type_ref: Some(method.return_type.clone()),
+                            span: method.span.clone(),
+                            scope: 0,
+                            modifiers: method.modifiers.clone(),
+                            parent: Some(class.name.clone()),
+                        },
+                    );
+                }
+            }
+            Declaration::Enum(enum_decl) => {
+                index.insert(
+                    &uri,
+                    Symbol {
+                        name: enum_decl.name.clone(),
+                        kind: SymbolKind::Enum,
+                        type_ref: Some(TypeRef::Primitive("int".to_string())),
+                        span: enum_decl.span.clone(),
+                        scope: 0,
+                        modifiers: Vec::new(),
+                        parent: None,
+                    },
+                );
+                for variant in &enum_decl.variants {
+                    index.insert(
+                        &uri,
+                        Symbol {
+                            name: format!("{}.{}", enum_decl.name, variant.name),
+                            kind: SymbolKind::EnumVariant,
+                            type_ref: Some(TypeRef::Primitive("int".to_string())),
+                            span: variant.span.clone(),
+                            scope: 0,
+                            modifiers: Vec::new(),
+                            parent: Some(enum_decl.name.clone()),
+                        },
+                    );
+                }
+            }
+            Declaration::Typedef(typedef) => {
+                index.insert(
+                    &uri,
+                    Symbol {
+                        name: typedef.name.clone(),
+                        kind: SymbolKind::Class, // typedef acts as an alias
+                        type_ref: Some(typedef.type_ref.clone()),
+                        span: typedef.span.clone(),
+                        scope: 0,
+                        modifiers: Vec::new(),
+                        parent: None,
+                    },
+                );
+            }
+            Declaration::Function(method) => {
+                index.insert(
+                    &uri,
+                    Symbol {
+                        name: method.name.clone(),
+                        kind: SymbolKind::Function,
+                        type_ref: Some(method.return_type.clone()),
+                        span: method.span.clone(),
+                        scope: 0,
+                        modifiers: method.modifiers.clone(),
+                        parent: None,
+                    },
+                );
+            }
+            Declaration::Variable(field) => {
+                index.insert(
+                    &uri,
+                    Symbol {
+                        name: field.name.clone(),
+                        kind: SymbolKind::Variable,
+                        type_ref: Some(field.type_ref.clone()),
+                        span: field.span.clone(),
+                        scope: 0,
+                        modifiers: field.modifiers.clone(),
+                        parent: None,
+                    },
+                );
+            }
         }
-        index
-            .by_name
-            .entry(symbol.name.clone())
-            .or_default()
-            .push(IndexedSymbol {
-                uri: uri.clone(),
-                symbol: symbol.clone(),
-            });
     }
 }
