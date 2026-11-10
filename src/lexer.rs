@@ -106,6 +106,7 @@ pub enum TokenType {
 
     // Special
     Comment(String),
+    Preprocessor(String),
     #[allow(dead_code)] // Reserved for potential whitespace-aware parsing
     Whitespace,
     Newline,
@@ -161,18 +162,39 @@ impl Lexer {
 
     pub fn tokenize(&mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
+        // Depth of nested #ifdef/#ifndef blocks currently being skipped.
+        // TODO: honor `defines[]` from config.cpp to conditionally keep branches.
+        let mut skip_depth: i32 = 0;
 
         loop {
             let token = self.next_token();
             let is_eof = matches!(token.token_type, TokenType::Eof);
 
-            // Skip whitespace and newlines for now, but keep them for future use
-            if !matches!(token.token_type, TokenType::Whitespace | TokenType::Newline) {
+            if is_eof {
                 tokens.push(token);
+                break;
             }
 
-            if is_eof {
-                break;
+            match &token.token_type {
+                TokenType::Preprocessor(directive) => {
+                    match directive.split_whitespace().next() {
+                        Some("ifdef") | Some("ifndef") => skip_depth += 1,
+                        Some("endif") => {
+                            skip_depth -= 1;
+                            if skip_depth < 0 {
+                                skip_depth = 0;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                TokenType::Whitespace | TokenType::Newline => {}
+                _ => {
+                    if skip_depth > 0 {
+                        continue;
+                    }
+                    tokens.push(token);
+                }
             }
         }
 
@@ -211,6 +233,11 @@ impl Lexer {
             } else if self.peek(1) == Some('*') {
                 return self.scan_multi_line_comment(start_line, start_column, start_offset);
             }
+        }
+
+        // Handle preprocessor directives (#ifdef, #endif, #include, ...)
+        if ch == '#' {
+            return self.scan_preprocessor(start_line, start_column, start_offset);
         }
 
         // Handle string literals
@@ -284,6 +311,25 @@ impl Lexer {
         Token::new(
             TokenType::Comment(comment_text.clone()),
             comment_text,
+            line,
+            column,
+            offset,
+        )
+    }
+
+    fn scan_preprocessor(&mut self, line: usize, column: usize, offset: usize) -> Token {
+        self.advance(); // '#'
+        let start = self.position;
+
+        while !self.is_at_end() && self.current_char() != '\n' {
+            self.advance();
+        }
+
+        let text: String = self.input[start..self.position].iter().collect();
+        let directive = text.trim().to_string();
+        Token::new(
+            TokenType::Preprocessor(directive.clone()),
+            directive,
             line,
             column,
             offset,
@@ -422,6 +468,11 @@ impl Lexer {
             "float" => TokenType::Float,
             "bool" => TokenType::Bool,
             "string" => TokenType::String,
+            // `vector` is both a primitive type and a global object (e.g. `vector.Distance`).
+            // When immediately followed by '.', it's the object — emit an identifier.
+            "vector" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "vector" => TokenType::Vector,
             "typename" => TokenType::Typename,
             "auto" => TokenType::Auto,

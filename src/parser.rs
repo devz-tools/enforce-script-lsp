@@ -941,21 +941,79 @@ impl Parser {
 
     fn is_type_start(&self) -> bool {
         if let Some(token) = self.current_opt() {
-            matches!(
-                token.token_type,
+            match &token.token_type {
                 TokenType::Void
-                    | TokenType::Int
-                    | TokenType::Float
-                    | TokenType::Bool
-                    | TokenType::String
-                    | TokenType::Vector
-                    | TokenType::Typename
-                    | TokenType::Auto
-                    | TokenType::Identifier(_)
-            )
+                | TokenType::Int
+                | TokenType::Float
+                | TokenType::Bool
+                | TokenType::String
+                | TokenType::Vector
+                | TokenType::Typename
+                | TokenType::Auto => true,
+                // A leading identifier is a type only in a `Type name` declaration;
+                // otherwise it begins an expression statement (`x = 1;`, `obj.M()`).
+                TokenType::Identifier(_) => self.identifier_starts_declaration(),
+                _ => false,
+            }
         } else {
             false
         }
+    }
+
+    /// Starting at a leading identifier, determine whether it begins a `Type name`
+    /// declaration (optionally `Type<...>` or `Type[...]`) rather than an expression
+    /// statement. A declaration is always followed by the variable name.
+    fn identifier_starts_declaration(&self) -> bool {
+        let n = self.tokens.len();
+        let mut i = self.position + 1;
+
+        // Skip comments
+        while i < n && matches!(self.tokens[i].token_type, TokenType::Comment(_)) {
+            i += 1;
+        }
+
+        // Skip template arguments: `Type<...>`
+        if i < n && matches!(self.tokens[i].token_type, TokenType::Less) {
+            let mut depth = 1usize;
+            i += 1;
+            while i < n && depth > 0 {
+                match &self.tokens[i].token_type {
+                    TokenType::Less => depth += 1,
+                    TokenType::Greater => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+
+        // Skip array bounds: `Type[...]`
+        loop {
+            while i < n && matches!(self.tokens[i].token_type, TokenType::Comment(_)) {
+                i += 1;
+            }
+            if i < n && matches!(self.tokens[i].token_type, TokenType::LeftBracket) {
+                let mut depth = 1usize;
+                i += 1;
+                while i < n && depth > 0 {
+                    match &self.tokens[i].token_type {
+                        TokenType::LeftBracket => depth += 1,
+                        TokenType::RightBracket => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Skip comments before the variable name
+        while i < n && matches!(self.tokens[i].token_type, TokenType::Comment(_)) {
+            i += 1;
+        }
+
+        // A declaration ends with the variable name.
+        i < n && matches!(self.tokens[i].token_type, TokenType::Identifier(_))
     }
 
     fn parse_if_statement(&mut self) -> Result<Statement, String> {

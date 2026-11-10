@@ -321,6 +321,10 @@ impl SemanticAnalyzer {
         method: &Method,
         class_name: Option<String>,
     ) -> Result<(), Vec<String>> {
+        // A method whose name equals its class name is a constructor — it must not
+        // collide with the class symbol that lives in the same scope.
+        let is_constructor = class_name.as_deref() == Some(method.name.as_str());
+
         let symbol = Symbol {
             name: method.name.clone(),
             kind: if class_name.is_some() {
@@ -336,7 +340,9 @@ impl SemanticAnalyzer {
         };
 
         if let Err(e) = self.symbol_table.define(symbol) {
-            self.errors.push(e);
+            if !is_constructor {
+                self.errors.push(e);
+            }
         }
 
         // Enter method scope
