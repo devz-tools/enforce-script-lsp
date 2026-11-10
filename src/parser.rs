@@ -489,6 +489,16 @@ impl Parser {
         }
     }
 
+    /// Consume a member name, handling destructors (`~ClassName`).
+    fn consume_member_name(&mut self) -> Result<String, String> {
+        if self.match_token(&[TokenType::BitwiseNot]) {
+            let name = self.consume_identifier("Expected destructor name")?;
+            Ok(format!("~{}", name))
+        } else {
+            self.consume_identifier("Expected member name")
+        }
+    }
+
     /// Consume an optional array size after a name: `[N]` or `[]`
     /// (e.g. `float arr[4];`). No-op when there is no `[`.
     fn consume_array_brackets(&mut self) -> Result<(), String> {
@@ -588,7 +598,7 @@ impl Parser {
         // Standard Enforce Script: type name = value; or type name(...) { }
         let start = Position::from_token(self.current());
         let type_ref = self.parse_type()?;
-        let name = self.consume_identifier("Expected member name")?;
+        let name = self.consume_member_name()?;
 
         // Array field: `float arr[4];` or `float arr[];`
         self.consume_array_brackets()?;
@@ -701,12 +711,15 @@ impl Parser {
             let variant_name = self.consume_identifier("Expected enum variant name")?;
 
             let value = if self.match_token(&[TokenType::Assign]) {
-                let expr = self.parse_primary()?;
-                if let Expression::IntLiteral(val, _) = expr {
-                    next_value = val + 1;
-                    Some(val)
-                } else {
-                    return Err("Enum variant value must be an integer".to_string());
+                // The value may be a bitwise mask (`A | B | C`), a negative int,
+                // or a reference to another variant — parse a full expression.
+                let expr = self.parse_expression()?;
+                match expr {
+                    Expression::IntLiteral(val, _) => {
+                        next_value = val + 1;
+                        Some(val)
+                    }
+                    _ => None, // non-computable value (mask / reference)
                 }
             } else {
                 let val = next_value;
