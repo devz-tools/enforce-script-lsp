@@ -159,6 +159,11 @@ pub struct GlobalEnvironment {
     pub class_parents: HashMap<String, Option<String>>,
     /// class name → set of member names (fields, methods, enum variants).
     pub class_members: HashMap<String, HashSet<String>>,
+    /// Every member name across all classes (union of `class_members` values).
+    /// Used as a lenient "is this name defined anywhere" fallback, so a broken
+    /// inheritance chain (a parent file that fails to parse) doesn't flood
+    /// "undefined identifier" noise.
+    pub all_members: HashSet<String>,
 }
 
 impl GlobalEnvironment {
@@ -595,15 +600,17 @@ impl SemanticAnalyzer {
             Expression::Identifier(name, span) => {
                 // Check if identifier is defined
                 if self.symbol_table.lookup(name).is_none() {
-                    // Resolve cross-file: a known global symbol, or a member
-                    // inherited from an ancestor of the current class.
+                    // Resolve cross-file: a known global, or a member inherited
+                    // from an ancestor — or (leniently) a member of any class,
+                    // so a broken inheritance chain doesn't flood "undefined".
                     let known_global = self.global_env.globals.contains(name);
                     let inherited = self
                         .symbol_table
                         .current_class
                         .as_deref()
                         .is_some_and(|c| self.global_env.has_member(c, name));
-                    if !name.contains('.') && !known_global && !inherited {
+                    let known_member = self.global_env.all_members.contains(name);
+                    if !name.contains('.') && !known_global && !inherited && !known_member {
                         self.warnings.push(format!(
                             "Undefined identifier '{}' at line {}",
                             name, span.start.line

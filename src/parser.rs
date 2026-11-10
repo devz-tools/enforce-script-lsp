@@ -837,10 +837,11 @@ impl Parser {
                 }
                 continue;
             }
-            // `volatile` / `owned` are type modifiers tokenized as identifiers.
+            // Type modifiers tokenized as identifiers (`volatile`, `owned`,
+            // `notnull`, `obsolete`).
             if let Some(token) = self.current_opt()
                 && let TokenType::Identifier(name) = &token.token_type
-                && (name == "volatile" || name == "owned")
+                && matches!(name.as_str(), "volatile" | "owned" | "notnull" | "obsolete")
             {
                 modifiers.push(name.clone());
                 self.advance();

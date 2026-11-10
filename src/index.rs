@@ -64,6 +64,7 @@ impl SymbolIndex {
                             .entry(parent.clone())
                             .or_default()
                             .insert(name.clone());
+                        env.all_members.insert(name.clone());
                     }
                 }
             }
