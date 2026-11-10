@@ -382,7 +382,7 @@ impl Parser {
         let start = Position::from_token(self.current());
         self.consume(&TokenType::Class, "Expected 'class'")?;
 
-        let name = self.consume_identifier("Expected class name")?;
+        let name = self.consume_class_name()?;
 
         // Parse template parameters
         let template_params = if self.match_token(&[TokenType::Less]) {
@@ -496,12 +496,37 @@ impl Parser {
             return Ok(());
         }
         if let Some(token) = self.current_opt() {
-            if let TokenType::IntLiteral(_) = token.token_type {
-                self.advance();
+            match &token.token_type {
+                // size is an int literal `[4]` or a constant `[ZERO_PAD_SIZE]`.
+                TokenType::IntLiteral(_) | TokenType::Identifier(_) => {
+                    self.advance();
+                }
+                _ => {}
             }
         }
         self.consume(&TokenType::RightBracket, "Expected ']' after '['")?;
         Ok(())
+    }
+
+    /// Consume a class name: usually an identifier, but in `1_core` the primitive
+    /// value types are declared as `class bool`, `class int`, `class vector`, etc.
+    fn consume_class_name(&mut self) -> Result<String, String> {
+        if let Some(token) = self.current_opt() {
+            let name = match &token.token_type {
+                TokenType::Identifier(name) => name.clone(),
+                TokenType::Bool => "bool".to_string(),
+                TokenType::Int => "int".to_string(),
+                TokenType::Float => "float".to_string(),
+                TokenType::String => "string".to_string(),
+                TokenType::Vector => "vector".to_string(),
+                TokenType::Typename => "typename".to_string(),
+                _ => return Err("Expected class name".to_string()),
+            };
+            self.advance();
+            Ok(name)
+        } else {
+            Err("Expected class name".to_string())
+        }
     }
 
     fn parse_class_member(&mut self) -> Result<(Vec<Method>, Vec<Field>), String> {
@@ -2621,6 +2646,41 @@ void Test()
     int x = 5;
     int y = (x > 0) ? 10 : 20;
 }
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_primitive_classes() {
+        // 1_core declares the primitive value types as classes.
+        let code = r#"
+class bool
+{
+    string ToString() { return "true"; }
+};
+class int
+{
+    const int MAX = 2147483647;
+    proto string ToString();
+};
+class float
+{
+    const float MIN = FLT_MIN;
+};
+class vector
+{
+    static const vector Up = "0 1 0";
+    proto native float Length();
+};
+class typename
+{
+    proto native bool IsInherited(typename baseType);
+};
 "#;
         let mut lexer = Lexer::new(code);
         let tokens = lexer.tokenize();
