@@ -13,8 +13,9 @@ pub struct LintConfig {
 impl Default for LintConfig {
     fn default() -> Self {
         LintConfig {
-            // codeguide: "лог-строка не длиннее ~6 конкатенаций" (Formula too complex)
-            max_concat: 6,
+            // Enforce "Formula too complex" — empirically ~15 `+` is still fine
+            // (botorama has working 15-operator chains).
+            max_concat: 15,
             // codeguide: длинная булева цепочка тоже падает (~8-10 слагаемых)
             max_logical: 8,
         }
@@ -285,8 +286,8 @@ mod tests {
 
     #[test]
     fn test_long_concat() {
-        // 7 '+' operators — over the threshold of 6.
-        let code = r#"void F() { string s = "a"+"b"+"c"+"d"+"e"+"f"+"g"+"h"; }"#;
+        // 16 '+' operators — over the threshold of 15.
+        let code = r#"void F() { string s = "a"+"b"+"c"+"d"+"e"+"f"+"g"+"h"+"i"+"j"+"k"+"l"+"m"+"n"+"o"+"p"+"q"; }"#;
         let issues = lint_code(code);
         assert!(issues.iter().any(|i| i.message.contains("Chained '+'")));
     }
