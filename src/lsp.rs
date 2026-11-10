@@ -8,6 +8,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::lexer::Lexer;
+use crate::index::SymbolIndex;
 use crate::parser::{Class, Declaration, Parser, Program};
 use crate::semantic::{SemanticAnalyzer, SymbolKind, SymbolTable};
 use crate::workspace::Workspace;
@@ -16,6 +17,7 @@ pub struct Backend {
     client: Client,
     documents: Arc<DashMap<String, DocumentData>>,
     workspace: Arc<RwLock<Option<Workspace>>>,
+    symbol_index: Arc<RwLock<Option<Arc<SymbolIndex>>>>,
 }
 
 struct DocumentData {
@@ -32,6 +34,7 @@ impl Backend {
             client,
             documents: Arc::new(DashMap::new()),
             workspace: Arc::new(RwLock::new(None)),
+            symbol_index: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -137,6 +140,7 @@ impl Backend {
 
     fn get_completions(&self, uri: &str, _position: Position) -> Vec<CompletionItem> {
         let mut items = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
 
         // Add keywords
         for keyword in &[
@@ -184,6 +188,7 @@ impl Backend {
             "break",
             "continue",
         ] {
+            seen.insert(keyword.to_string());
             items.push(CompletionItem {
                 label: keyword.to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
@@ -192,27 +197,25 @@ impl Backend {
             });
         }
 
-        // Add symbols from symbol table
+        // Add symbols from the current document's symbol table.
         if let Some(doc) = self.documents.get(uri)
             && let Some(ref symbol_table) = doc.symbol_table
         {
             for symbol in symbol_table.get_all_symbols() {
-                let kind = match symbol.kind {
-                    SymbolKind::Class => CompletionItemKind::CLASS,
-                    SymbolKind::Enum => CompletionItemKind::ENUM,
-                    SymbolKind::Function | SymbolKind::Method => CompletionItemKind::FUNCTION,
-                    SymbolKind::Field => CompletionItemKind::FIELD,
-                    SymbolKind::Variable => CompletionItemKind::VARIABLE,
-                    SymbolKind::Parameter => CompletionItemKind::VARIABLE,
-                    SymbolKind::EnumVariant => CompletionItemKind::ENUM_MEMBER,
-                };
+                if seen.insert(symbol.name.clone()) {
+                    items.push(symbol_to_completion(symbol));
+                }
+            }
+        }
 
-                items.push(CompletionItem {
-                    label: symbol.name.clone(),
-                    kind: Some(kind),
-                    detail: symbol.type_ref.as_ref().map(|t| format!("{:?}", t)),
-                    ..Default::default()
-                });
+        // Add symbols from the cross-file index.
+        if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+            for (name, occs) in &index.by_name {
+                if seen.insert(name.clone())
+                    && let Some(occ) = occs.first()
+                {
+                    items.push(symbol_to_completion(&occ.symbol));
+                }
             }
         }
 
@@ -220,45 +223,26 @@ impl Backend {
     }
 
     fn get_hover(&self, uri: &str, position: Position) -> Option<Hover> {
-        if let Some(doc) = self.documents.get(uri) {
-            // Find symbol name at position
-            if let Some(symbol_name) = find_symbol_at_position(&doc.text, position) {
-                // Look up symbol in symbol table
-                if let Some(ref symbol_table) = doc.symbol_table
-                    && let Some(symbol) = symbol_table.lookup(&symbol_name)
-                {
-                    let kind_str = match symbol.kind {
-                        crate::semantic::SymbolKind::Class => "class",
-                        crate::semantic::SymbolKind::Enum => "enum",
-                        crate::semantic::SymbolKind::Function => "function",
-                        crate::semantic::SymbolKind::Method => "method",
-                        crate::semantic::SymbolKind::Field => "field",
-                        crate::semantic::SymbolKind::Variable => "variable",
-                        crate::semantic::SymbolKind::Parameter => "parameter",
-                        crate::semantic::SymbolKind::EnumVariant => "enum variant",
-                    };
+        let symbol_name = self
+            .documents
+            .get(uri)
+            .and_then(|doc| find_symbol_at_position(&doc.text, position))?;
 
-                    let type_str = if let Some(ref type_ref) = symbol.type_ref {
-                        format!("{:?}", type_ref)
-                    } else {
-                        "unknown".to_string()
-                    };
-
-                    let value = format!(
-                        "```enforcescript\n({}) {}: {}\n```",
-                        kind_str, symbol.name, type_str
-                    );
-
-                    return Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value,
-                        }),
-                        range: Some(span_to_range(&symbol.span)),
-                    });
-                }
-            }
+        // Local symbol table.
+        if let Some(doc) = self.documents.get(uri)
+            && let Some(ref symbol_table) = doc.symbol_table
+            && let Some(symbol) = symbol_table.lookup(&symbol_name)
+        {
+            return Some(symbol_to_hover(symbol));
         }
+
+        // Cross-file index.
+        if let Some(index) = self.symbol_index.read().unwrap().as_ref()
+            && let Some(occ) = index.lookup(&symbol_name).first()
+        {
+            return Some(symbol_to_hover(&occ.symbol));
+        }
+
         None
     }
 
@@ -377,6 +361,62 @@ fn span_to_range(span: &crate::parser::Span) -> Range {
         Position::new((span.start.line - 1) as u32, (span.start.column - 1) as u32),
         Position::new((span.end.line - 1) as u32, (span.end.column - 1) as u32),
     )
+}
+
+/// Whether a symbol kind is a top-level "definition" (as opposed to a member).
+fn is_definition_kind(kind: &SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class | SymbolKind::Enum | SymbolKind::Function | SymbolKind::Variable
+    )
+}
+
+/// Convert a semantic symbol to a completion item.
+fn symbol_to_completion(symbol: &crate::semantic::Symbol) -> CompletionItem {
+    let kind = match symbol.kind {
+        SymbolKind::Class => CompletionItemKind::CLASS,
+        SymbolKind::Enum => CompletionItemKind::ENUM,
+        SymbolKind::Function | SymbolKind::Method => CompletionItemKind::FUNCTION,
+        SymbolKind::Field => CompletionItemKind::FIELD,
+        SymbolKind::Variable => CompletionItemKind::VARIABLE,
+        SymbolKind::Parameter => CompletionItemKind::VARIABLE,
+        SymbolKind::EnumVariant => CompletionItemKind::ENUM_MEMBER,
+    };
+    CompletionItem {
+        label: symbol.name.clone(),
+        kind: Some(kind),
+        detail: symbol.type_ref.as_ref().map(|t| format!("{:?}", t)),
+        ..Default::default()
+    }
+}
+
+/// Convert a semantic symbol to a hover.
+fn symbol_to_hover(symbol: &crate::semantic::Symbol) -> Hover {
+    let kind_str = match symbol.kind {
+        SymbolKind::Class => "class",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Function => "function",
+        SymbolKind::Method => "method",
+        SymbolKind::Field => "field",
+        SymbolKind::Variable => "variable",
+        SymbolKind::Parameter => "parameter",
+        SymbolKind::EnumVariant => "enum variant",
+    };
+    let type_str = match &symbol.type_ref {
+        Some(t) => format!("{:?}", t),
+        None => "unknown".to_string(),
+    };
+    let value = format!(
+        "```enforcescript\n({}) {}: {}\n```",
+        kind_str, symbol.name, type_str
+    );
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: Some(span_to_range(&symbol.span)),
+    }
 }
 
 /// Extract line number from error message (format: "... at line N")
@@ -508,9 +548,26 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        self.client
-            .log_message(MessageType::INFO, "Enforce Script LSP initialized")
-            .await;
+        // Build the cross-file symbol index from the workspace (blocking, but
+        // the project is small; optimize with spawn_blocking later if needed).
+        let indexed = {
+            let ws = self.workspace.read().unwrap();
+            match ws.as_ref() {
+                Some(ws) => {
+                    let index = SymbolIndex::build(ws);
+                    let n = index.by_name.len();
+                    *self.symbol_index.write().unwrap() = Some(Arc::new(index));
+                    Some(n)
+                }
+                None => None,
+            }
+        };
+
+        let msg = match indexed {
+            Some(n) => format!("Enforce Script LSP initialized ({} indexed symbols)", n),
+            None => "Enforce Script LSP initialized".to_string(),
+        };
+        self.client.log_message(MessageType::INFO, msg).await;
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -602,19 +659,42 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
         let uri_str = uri.to_string();
 
-        if let Some(doc) = self.documents.get(&uri_str) {
-            // Find symbol name at position
-            if let Some(symbol_name) = find_symbol_at_position(&doc.text, position) {
-                // Look up symbol in symbol table
-                if let Some(ref symbol_table) = doc.symbol_table
-                    && let Some(symbol) = symbol_table.lookup(&symbol_name)
-                {
-                    let location = Location {
-                        uri,
-                        range: span_to_range(&symbol.span),
-                    };
-                    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
-                }
+        let symbol_name = self
+            .documents
+            .get(&uri_str)
+            .and_then(|doc| find_symbol_at_position(&doc.text, position));
+        let Some(symbol_name) = symbol_name else {
+            return Ok(None);
+        };
+
+        // 1. Local: current document's symbol table.
+        if let Some(doc) = self.documents.get(&uri_str)
+            && let Some(ref symbol_table) = doc.symbol_table
+            && let Some(symbol) = symbol_table.lookup(&symbol_name)
+        {
+            let location = Location {
+                uri,
+                range: span_to_range(&symbol.span),
+            };
+            return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+        }
+
+        // 2. Cross-file: global index (prefer a definition in another file).
+        if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+            let matches = index.lookup(&symbol_name);
+            let best = matches
+                .iter()
+                .find(|m| m.uri != uri_str && is_definition_kind(&m.symbol.kind))
+                .or_else(|| matches.iter().find(|m| m.uri != uri_str))
+                .or_else(|| matches.first());
+            if let Some(m) = best
+                && let Ok(url) = Url::parse(&m.uri)
+            {
+                let location = Location {
+                    uri: url,
+                    range: span_to_range(&m.symbol.span),
+                };
+                return Ok(Some(GotoDefinitionResponse::Scalar(location)));
             }
         }
 

@@ -1,3 +1,4 @@
+mod index;
 mod lexer;
 mod lsp;
 mod parser;
