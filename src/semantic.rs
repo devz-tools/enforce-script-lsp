@@ -373,9 +373,13 @@ impl SemanticAnalyzer {
             }
         }
 
-        // Analyze methods
+        // Register all methods first (so forward references within the class
+        // resolve), then analyze their bodies.
         for method in &class.methods {
-            self.analyze_method(method, Some(class.name.clone()))?;
+            self.register_method(method, Some(class.name.clone()))?;
+        }
+        for method in &class.methods {
+            self.analyze_method_body(method, Some(class.name.clone()))?;
         }
 
         self.symbol_table.exit_scope();
@@ -384,10 +388,11 @@ impl SemanticAnalyzer {
     }
 
     fn analyze_function(&mut self, function: &Method) -> Result<(), Vec<String>> {
-        self.analyze_method(function, None)
+        self.register_method(function, None)?;
+        self.analyze_method_body(function, None)
     }
 
-    fn analyze_method(
+    fn register_method(
         &mut self,
         method: &Method,
         class_name: Option<String>,
@@ -416,6 +421,14 @@ impl SemanticAnalyzer {
             }
         }
 
+        Ok(())
+    }
+
+    fn analyze_method_body(
+        &mut self,
+        method: &Method,
+        class_name: Option<String>,
+    ) -> Result<(), Vec<String>> {
         // Enter method scope
         self.symbol_table.enter_scope();
 

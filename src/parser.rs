@@ -1156,6 +1156,19 @@ impl Parser {
         i + 1 < n && matches!(self.tokens[i + 1].token_type, TokenType::Dot)
     }
 
+    /// Parse a statement, or an empty block when the body was removed by
+    /// preprocessor `#ifdef` (e.g. `if (cond) #ifdef X stmt #endif` with X undefined).
+    fn parse_statement_or_empty(&mut self) -> Result<Statement, String> {
+        if self.check(&TokenType::RightBrace) || self.check(&TokenType::Else) {
+            let pos = Position::from_token(self.current());
+            return Ok(Statement::Block {
+                statements: Vec::new(),
+                span: Span::new(pos.clone(), pos),
+            });
+        }
+        self.parse_statement()
+    }
+
     fn parse_if_statement(&mut self) -> Result<Statement, String> {
         let start = Position::from_token(self.previous().unwrap());
 
@@ -1163,10 +1176,10 @@ impl Parser {
         let condition = self.parse_expression()?;
         self.consume(&TokenType::RightParen, "Expected ')'")?;
 
-        let then_branch = Box::new(self.parse_statement()?);
+        let then_branch = Box::new(self.parse_statement_or_empty()?);
 
         let else_branch = if self.match_token(&[TokenType::Else]) {
-            Some(Box::new(self.parse_statement()?))
+            Some(Box::new(self.parse_statement_or_empty()?))
         } else {
             None
         };

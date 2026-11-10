@@ -176,6 +176,20 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
                             parent: Some(enum_decl.name.clone()),
                         },
                     );
+                    // DayZ also exposes each variant as a C++-style global
+                    // `EnumNameVariantName` (e.g. ObjIntersectView = ObjIntersect.View).
+                    index.insert(
+                        &uri,
+                        Symbol {
+                            name: format!("{}{}", enum_decl.name, variant.name),
+                            kind: SymbolKind::EnumVariant,
+                            type_ref: Some(TypeRef::Primitive("int".to_string())),
+                            span: variant.span.clone(),
+                            scope: 0,
+                            modifiers: Vec::new(),
+                            parent: None,
+                        },
+                    );
                 }
             }
             Declaration::Typedef(typedef) => {
