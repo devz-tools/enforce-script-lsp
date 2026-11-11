@@ -757,6 +757,23 @@ fn span_within(outer: &Span, inner: &Span) -> bool {
     inner.start.line >= outer.start.line && inner.end.line <= outer.end.line
 }
 
+/// Find the (0-based line, 0-based char column) of `name` within `span`, by
+/// searching the lines of `text` covered by the span for the first occurrence.
+fn find_name_position(text: &str, span: &Span, name: &str) -> Option<(u32, u32)> {
+    let lines: Vec<&str> = text.lines().collect();
+    // Parser spans use 1-based lines; convert to 0-based.
+    let start = span.start.line.saturating_sub(1);
+    let end = span.end.line.min(lines.len());
+    for idx in start..end {
+        let line = lines[idx];
+        if let Some(byte_col) = line.find(name) {
+            let col = line[..byte_col].chars().count() as u32;
+            return Some((idx as u32, col));
+        }
+    }
+    None
+}
+
 fn enclosing_class(program: &Program, position: Position) -> Option<String> {
     // LSP lines/characters are 0-based; parser spans are 1-based.
     let line = position.line as usize + 1;
@@ -973,6 +990,26 @@ impl LanguageServer for Backend {
                 rename_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                        work_done_progress_options: Default::default(),
+                        legend: SemanticTokensLegend {
+                            token_types: vec![
+                                SemanticTokenType::CLASS,
+                                SemanticTokenType::ENUM,
+                                SemanticTokenType::FUNCTION,
+                                SemanticTokenType::METHOD,
+                                SemanticTokenType::PROPERTY,
+                                SemanticTokenType::VARIABLE,
+                                SemanticTokenType::PARAMETER,
+                                SemanticTokenType::ENUM_MEMBER,
+                            ],
+                            token_modifiers: vec![SemanticTokenModifier::DECLARATION],
+                        },
+                        range: Some(false),
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                    }),
+                ),
                 ..Default::default()
             },
         })
@@ -1029,6 +1066,62 @@ impl LanguageServer for Backend {
 
         let items = self.get_completions(&uri, position);
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri.to_string();
+        let Some(doc) = self.documents.get(&uri) else {
+            return Ok(None);
+        };
+        let Some(st) = doc.symbol_table.as_ref() else {
+            return Ok(None);
+        };
+
+        // Map each symbol's name to a (line, col, len, token_type) tuple.
+        let mut raw: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for s in st.get_all_symbols() {
+            let type_index = match s.kind {
+                SymbolKind::Class => 0,
+                SymbolKind::Enum => 1,
+                SymbolKind::Function => 2,
+                SymbolKind::Method => 3,
+                SymbolKind::Field => 4,
+                SymbolKind::Variable => 5,
+                SymbolKind::Parameter => 6,
+                SymbolKind::EnumVariant => 7,
+            };
+            let Some((line, col)) = find_name_position(&doc.text, &s.span, &s.name) else {
+                continue;
+            };
+            let len = s.name.chars().count() as u32;
+            raw.push((line, col, len, type_index));
+        }
+
+        // Delta-encode (sorted by position).
+        raw.sort_by_key(|&(l, c, _, _)| (l, c));
+        let mut data = Vec::with_capacity(raw.len());
+        let (mut prev_line, mut prev_col) = (0u32, 0u32);
+        for (line, col, len, type_index) in raw {
+            let delta_line = line - prev_line;
+            let delta_start = if delta_line == 0 { col - prev_col } else { col };
+            data.push(SemanticToken {
+                delta_line,
+                delta_start,
+                length: len,
+                token_type: type_index,
+                token_modifiers_bitset: 1, // declaration
+            });
+            prev_line = line;
+            prev_col = col;
+        }
+
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -1389,6 +1482,19 @@ mod tests {
         assert_eq!(m.start.line, 5);
         // Line 0 (0-based) is the class header, not inside any method.
         assert!(enclosing_method(&program, pos(0, 5)).is_none());
+    }
+
+    #[test]
+    fn test_find_name_position() {
+        use crate::parser::{Position, Span};
+
+        // Cyrillic comment above the class — exercises char-vs-byte handling
+        // (must not panic on a non-char boundary, and must locate the name).
+        let text = "//! комментарий про бота\nclass dmAISurvivor\n{\n}";
+        let span = Span::new(Position::new(2, 1, 0), Position::new(4, 1, 0));
+        let (line, col) = find_name_position(text, &span, "dmAISurvivor").unwrap();
+        assert_eq!(line, 1); // 0-based line 1
+        assert_eq!(col, 6); // after "class "
     }
 
     #[test]
