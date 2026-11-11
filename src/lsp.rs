@@ -12,7 +12,7 @@ use crate::lexer::Lexer;
 use crate::index::{IndexedSymbol, SymbolIndex};
 use crate::lint::{lint, LintConfig, LintIssue};
 use crate::parser::{type_ref_base_name, Class, Declaration, Parser, Program};
-use crate::semantic::{SemanticAnalyzer, SymbolKind, SymbolTable};
+use crate::semantic::{SemanticAnalyzer, Symbol, SymbolKind, SymbolTable};
 use crate::workspace::Workspace;
 
 pub struct Backend {
@@ -229,24 +229,75 @@ impl Backend {
             });
         }
 
-        // Add symbols from the current document's symbol table.
-        if let Some(doc) = self.documents.get(uri)
-            && let Some(ref symbol_table) = doc.symbol_table
-        {
-            for symbol in symbol_table.get_all_symbols() {
-                if seen.insert(symbol.name.clone()) {
-                    items.push(symbol_to_completion(symbol));
+        // Determine the enclosing class and its inheritance chain. Completion
+        // shows the current class's members first, then its ancestors', then
+        // globals — members of unrelated classes are excluded (strict namespace).
+        let chain: Vec<String> = {
+            let doc = self.documents.get(uri);
+            let class = doc
+                .as_ref()
+                .and_then(|d| d.program.as_ref())
+                .and_then(|p| enclosing_class(p, position));
+            match class {
+                Some(c) => match self.symbol_index.read().unwrap().as_ref() {
+                    Some(index) => ancestry_chain(&c, index),
+                    None => vec![c],
+                },
+                None => Vec::new(),
+            }
+        };
+
+        // 1. Class members: the current class, then each ancestor, in order.
+        for class in &chain {
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+                for occs in index.by_name.values() {
+                    if let Some(occ) = occs.iter().find(|o| is_class_member_of(&o.symbol, class))
+                        && seen.insert(occ.symbol.name.clone())
+                    {
+                        items.push(symbol_to_completion(&occ.symbol));
+                    }
+                }
+            }
+            if let Some(doc) = self.documents.get(uri)
+                && let Some(st) = doc.symbol_table.as_ref()
+            {
+                for s in st.get_all_symbols() {
+                    if is_class_member_of(s, class) && seen.insert(s.name.clone()) {
+                        items.push(symbol_to_completion(s));
+                    }
                 }
             }
         }
 
-        // Add symbols from the cross-file index.
+        // 2. Globals (classes, enums, typedefs, functions, globals, enum variants).
         if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
             for (name, occs) in &index.by_name {
-                if seen.insert(name.clone())
-                    && let Some(occ) = occs.first()
+                if let Some(occ) = occs.iter().find(|o| o.symbol.parent.is_none())
+                    && seen.insert(name.clone())
                 {
                     items.push(symbol_to_completion(&occ.symbol));
+                }
+            }
+        }
+        if let Some(doc) = self.documents.get(uri)
+            && let Some(st) = doc.symbol_table.as_ref()
+        {
+            for s in st.get_all_symbols() {
+                if s.parent.is_none() && seen.insert(s.name.clone()) {
+                    items.push(symbol_to_completion(s));
+                }
+            }
+        }
+
+        // 3. Local variables/parameters (visible within the current method).
+        if let Some(doc) = self.documents.get(uri)
+            && let Some(st) = doc.symbol_table.as_ref()
+        {
+            for s in st.get_all_symbols() {
+                if matches!(s.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                    && seen.insert(s.name.clone())
+                {
+                    items.push(symbol_to_completion(s));
                 }
             }
         }
@@ -747,6 +798,30 @@ fn resolve_type_name(object: &str, doc: &DocumentData, index: &SymbolIndex) -> O
     None
 }
 
+/// Build the inheritance chain `[class, parent, grandparent, …]`, guarding
+/// against cycles (via a step cap).
+fn ancestry_chain(class: &str, index: &SymbolIndex) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = Some(class.to_string());
+    let mut guard = 0;
+    while let Some(c) = current {
+        chain.push(c.clone());
+        current = index.class_parents.get(&c).cloned().flatten();
+        guard += 1;
+        if guard > 100 {
+            break;
+        }
+    }
+    chain
+}
+
+/// Whether `symbol` is a field/method declared directly in `class` (as opposed
+/// to a global, a local variable, or a member of another class).
+fn is_class_member_of(symbol: &Symbol, class: &str) -> bool {
+    matches!(symbol.kind, SymbolKind::Field | SymbolKind::Method)
+        && symbol.parent.as_deref() == Some(class)
+}
+
 /// Collect the members of `type_name` (walking the inheritance chain) as
 /// completion items, filtered by `partial`. Sources: the cross-file index
 /// (for inherited/other-file members) and the current document's symbol table
@@ -758,17 +833,7 @@ fn collect_members(
     partial: &str,
 ) -> Vec<CompletionItem> {
     // Build the ancestry chain (type + all ancestors), guarding against cycles.
-    let mut chain = Vec::new();
-    let mut current = Some(type_name.to_string());
-    let mut guard = 0;
-    while let Some(c) = current {
-        chain.push(c.clone());
-        current = index.class_parents.get(&c).cloned().flatten();
-        guard += 1;
-        if guard > 100 {
-            break;
-        }
-    }
+    let chain = ancestry_chain(type_name, index);
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut items = Vec::new();
@@ -815,17 +880,7 @@ fn find_member_in_hierarchy<'a>(
     name: &str,
     index: &'a SymbolIndex,
 ) -> Option<&'a IndexedSymbol> {
-    let mut chain = Vec::new();
-    let mut current = Some(class.to_string());
-    let mut guard = 0;
-    while let Some(c) = current {
-        chain.push(c.clone());
-        current = index.class_parents.get(&c).cloned().flatten();
-        guard += 1;
-        if guard > 100 {
-            break;
-        }
-    }
+    let chain = ancestry_chain(class, index);
     index
         .lookup(name)
         .iter()
@@ -1328,5 +1383,29 @@ mod tests {
         assert_eq!(found.symbol.parent.as_deref(), Some("Base"));
         // Not part of the hierarchy → None.
         assert!(find_member_in_hierarchy("Unrelated", "m_value", &index).is_none());
+    }
+
+    #[test]
+    fn test_is_class_member_of() {
+        use crate::parser::{Position, Span};
+
+        let mk = |name: &str, kind: SymbolKind, parent: Option<&str>| Symbol {
+            name: name.to_string(),
+            kind,
+            type_ref: None,
+            span: Span::new(Position::new(0, 0, 0), Position::new(0, 1, 1)),
+            scope: 0,
+            modifiers: Vec::new(),
+            parent: parent.map(|s| s.to_string()),
+        };
+
+        // A field/method of the current class → a class member.
+        assert!(is_class_member_of(&mk("m_x", SymbolKind::Field, Some("A")), "A"));
+        assert!(is_class_member_of(&mk("Do", SymbolKind::Method, Some("A")), "A"));
+        // A member of an unrelated class → NOT a member of `A`.
+        assert!(!is_class_member_of(&mk("m_x", SymbolKind::Field, Some("B")), "A"));
+        // Globals and locals are handled separately (not class members).
+        assert!(!is_class_member_of(&mk("F", SymbolKind::Function, None), "A"));
+        assert!(!is_class_member_of(&mk("local", SymbolKind::Variable, Some("A")), "A"));
     }
 }
