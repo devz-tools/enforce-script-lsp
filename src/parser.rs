@@ -919,7 +919,7 @@ impl Parser {
             // `notnull`, `obsolete`).
             if let Some(token) = self.current_opt()
                 && let TokenType::Identifier(name) = &token.token_type
-                && matches!(name.as_str(), "volatile" | "owned" | "notnull" | "obsolete" | "reference" | "event" | "local" | "sealed")
+                && matches!(name.as_str(), "volatile" | "owned" | "notnull" | "obsolete" | "reference" | "event" | "local" | "sealed" | "external")
             {
                 modifiers.push(name.clone());
                 self.advance();
@@ -3158,6 +3158,23 @@ class typename
         let result = parser.parse();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_external_modifier() {
+        // `external` is a method modifier (like `proto native`) — it must not be
+        // mistaken for the return type, or the method name is lost.
+        let code = r#"
+class Entity
+{
+    proto native external EntityEvent SetEventMask(EntityEvent e);
+};
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+        assert!(result.is_ok(), "expected external modifier to parse, got {:?}", result);
     }
 
     #[test]
