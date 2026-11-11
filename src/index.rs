@@ -89,9 +89,12 @@ fn index_dir(dir: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
 }
 
 fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(bytes) = std::fs::read(path) else {
         return;
     };
+    // Tolerate non-UTF-8 bytes (some vanilla files use Windows-1252) — replace
+    // them with U+FFFD instead of skipping the whole file.
+    let text = String::from_utf8_lossy(&bytes).into_owned();
 
     let mut lexer = Lexer::new(&text);
     lexer.set_active_defines(&workspace.defines_for(path));
