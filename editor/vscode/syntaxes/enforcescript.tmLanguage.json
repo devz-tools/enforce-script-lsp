@@ -16,78 +16,70 @@
     "comments": {
       "patterns": [
         {
-          "name": "comment.block.enforcescript",
+          "name": "comment.block",
           "begin": "/\\*",
-          "end": "\\*/",
-          "patterns": [{ "include": "#comments" }]
+          "end": "\\*/"
         },
         {
-          "name": "comment.line.double-slash.enforcescript",
-          "match": "//.*$"
+          "name": "comment.line.double-slash",
+          "match": "//.*"
         }
       ]
     },
     "strings": {
-      "name": "string.quoted.double.enforcescript",
+      "name": "string.quoted.double",
       "begin": "\"",
       "end": "\"",
       "patterns": [
         {
-          "name": "constant.character.escape.enforcescript",
+          "name": "constant.character.escape",
           "match": "\\\\."
         }
       ]
     },
     "numbers": {
-      "name": "constant.numeric.enforcescript",
+      "name": "constant.numeric",
       "match": "\\b(0[xX][0-9a-fA-F]+|\\d+(\\.\\d+)?([eE][+-]?\\d+)?[fF]?)\\b"
     },
     "preprocessor": {
       "patterns": [
         {
-          "name": "meta.preprocessor.enforcescript",
-          "begin": "^\\s*(#)",
-          "end": "$",
-          "beginCaptures": {
-            "1": { "name": "punctuation.definition.directive.enforcescript" }
-          },
-          "patterns": [
-            {
-              "name": "keyword.control.directive.enforcescript",
-              "match": "\\b(ifdef|ifndef|else|endif|include|define|undef|pragma|error|warning)\\b"
-            }
-          ]
+          "match": "(#)\\s*(ifdef|ifndef|else|endif|include|define|undef|pragma|error|warning)\\b",
+          "captures": {
+            "1": { "name": "punctuation.definition.directive" },
+            "2": { "name": "keyword.control.directive" }
+          }
         }
       ]
     },
     "keywords": {
       "patterns": [
         {
-          "name": "keyword.control.enforcescript",
+          "name": "keyword.control",
           "match": "\\b(if|else|switch|case|default|for|foreach|while|break|continue|return)\\b"
         },
         {
-          "name": "keyword.other.enforcescript",
+          "name": "keyword.other",
           "match": "\\b(class|enum|typedef|extends|modded|typename)\\b"
         },
         {
-          "name": "keyword.operator.word.enforcescript",
+          "name": "keyword.operator.word",
           "match": "\\b(new|delete)\\b"
         }
       ]
     },
     "types": {
-      "name": "storage.type.enforcescript",
+      "name": "storage.type",
       "match": "\\b(void|int|float|bool|string|vector|auto)\\b"
     },
     "modifiers": {
-      "name": "storage.modifier.enforcescript",
+      "name": "storage.modifier",
       "match": "\\b(private|protected|static|override|const|ref|autoptr|out|inout|thread|proto|native)\\b"
     },
     "constants": {
       "patterns": [
         {
-          "name": "constant.language.enforcescript",
+          "name": "constant.language",
           "match": "\\b(true|false|null|this|super)\\b"
         }
       ]
