@@ -2536,6 +2536,42 @@ void Method()
     }
 
     #[test]
+    fn test_parse_if_with_preprocessor_else() {
+        // The `else` branch may be conditionally compiled via `#ifdef X`. Both
+        // the defined (else kept → normal if-else) and undefined (else skipped
+        // → plain if) cases must parse without an orphan/unmatched `else`.
+        let code = r#"
+void Method()
+{
+    int a = 4;
+    if (a > 0)
+    {
+        Print("a");
+    }
+#ifdef X
+    else
+    {
+        Print("else");
+    }
+#endif
+}
+"#;
+
+        // X defined → the `else` branch is kept, forming a normal if-else.
+        let mut lexer = Lexer::new(code);
+        lexer.set_active_defines(&["X".to_string()].into_iter().collect());
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        assert!(parser.parse().is_ok());
+
+        // X undefined → the `else` branch is skipped, leaving a plain `if`.
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        assert!(parser.parse().is_ok());
+    }
+
+    #[test]
     fn test_parse_switch_statement() {
         let code = r#"
 void Method()
