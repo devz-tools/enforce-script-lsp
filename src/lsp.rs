@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 /// LSP Server implementation for Enforce Script
@@ -19,6 +20,7 @@ pub struct Backend {
     documents: Arc<DashMap<String, DocumentData>>,
     workspace: Arc<RwLock<Option<Workspace>>>,
     symbol_index: Arc<RwLock<Option<Arc<SymbolIndex>>>>,
+    lenient_member_scope: Arc<AtomicBool>,
 }
 
 struct DocumentData {
@@ -36,6 +38,7 @@ impl Backend {
             documents: Arc::new(DashMap::new()),
             workspace: Arc::new(RwLock::new(None)),
             symbol_index: Arc::new(RwLock::new(None)),
+            lenient_member_scope: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -94,6 +97,7 @@ impl Backend {
             if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
                 analyzer.set_global_environment(index.environment());
             }
+            analyzer.set_lenient_member_scope(self.lenient_member_scope.load(Ordering::Relaxed));
             match analyzer.analyze(prog) {
                 Ok(_) => {
                     // Add warnings as diagnostics
@@ -287,7 +291,39 @@ impl Backend {
         let doc = self.documents.get(uri)?;
         let symbol_name = find_symbol_at_position(&doc.text, position)?;
 
-        // Resolve as a member of the enclosing class (field/method), incl. inherited.
+        let lenient = self.lenient_member_scope.load(Ordering::Relaxed);
+
+        // 1. Member access (`obj.name`): resolve via the OBJECT's type.
+        if let Some((object, _partial)) = find_member_context(&doc.text, position) {
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+                let type_name = if object == "this" || object == "super" {
+                    let enclosing = doc
+                        .program
+                        .as_ref()
+                        .and_then(|p| enclosing_class(p, position));
+                    match (object.as_str(), enclosing) {
+                        ("super", Some(c)) => index.class_parents.get(&c).cloned().flatten(),
+                        (_, Some(c)) => Some(c),
+                        _ => None,
+                    }
+                } else {
+                    resolve_type_name(&object, &doc, index)
+                };
+                if let Some(type_name) = type_name {
+                    if let Some(symbol_table) = doc.symbol_table.as_ref()
+                        && let Some(symbol) = symbol_table.lookup_in_class(&type_name, &symbol_name)
+                    {
+                        return Some(symbol_to_hover(symbol));
+                    }
+                    if let Some(occ) = find_member_in_hierarchy(&type_name, &symbol_name, index) {
+                        return Some(symbol_to_hover(&occ.symbol));
+                    }
+                }
+            }
+            return None;
+        }
+
+        // 2. Bare identifier: the enclosing class (and ancestors), then globals.
         if let Some(class) = doc
             .program
             .as_ref()
@@ -305,18 +341,24 @@ impl Backend {
             }
         }
 
-        // Local symbol table.
+        // 3. Local symbol table.
         if let Some(symbol_table) = doc.symbol_table.as_ref()
             && let Some(symbol) = symbol_table.lookup(&symbol_name)
         {
             return Some(symbol_to_hover(symbol));
         }
 
-        // Cross-file index.
-        if let Some(index) = self.symbol_index.read().unwrap().as_ref()
-            && let Some(occ) = index.lookup(&symbol_name).first()
-        {
-            return Some(symbol_to_hover(&occ.symbol));
+        // 4. Cross-file: a global symbol; in lenient mode, also a same-named
+        //    member of another class.
+        if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+            let matches = index.lookup(&symbol_name);
+            let best = matches
+                .iter()
+                .find(|m| is_definition_kind(&m.symbol.kind))
+                .or_else(|| if lenient { matches.first() } else { None });
+            if let Some(m) = best {
+                return Some(symbol_to_hover(&m.symbol));
+            }
         }
 
         None
@@ -527,6 +569,14 @@ fn extract_dependency_roots(opts: &Option<serde_json::Value>) -> Vec<std::path::
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Extract `lenientMemberScope` from initialization options (default `false`).
+fn extract_lenient_member_scope(opts: &Option<serde_json::Value>) -> bool {
+    opts.as_ref()
+        .and_then(|v| v.get("lenientMemberScope"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// Extract line number from error message (format: "... at line N")
@@ -793,6 +843,10 @@ impl LanguageServer for Backend {
                 *self.workspace.write().unwrap() = Some(workspace);
             }
         }
+        self.lenient_member_scope.store(
+            extract_lenient_member_scope(&params.initialization_options),
+            Ordering::Relaxed,
+        );
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -950,7 +1004,50 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        // Resolve as a member of the enclosing class (field/method), incl. inherited.
+        let lenient = self.lenient_member_scope.load(Ordering::Relaxed);
+
+        // 1. Member access (`obj.name`): resolve the member via the OBJECT's type
+        //    (not the enclosing class), including inherited members.
+        if let Some((object, _partial)) = find_member_context(&doc.text, position) {
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+                let type_name = if object == "this" || object == "super" {
+                    let enclosing = doc
+                        .program
+                        .as_ref()
+                        .and_then(|p| enclosing_class(p, position));
+                    match (object.as_str(), enclosing) {
+                        ("super", Some(c)) => index.class_parents.get(&c).cloned().flatten(),
+                        (_, Some(c)) => Some(c),
+                        _ => None,
+                    }
+                } else {
+                    resolve_type_name(&object, &doc, index)
+                };
+                if let Some(type_name) = type_name {
+                    if let Some(symbol_table) = doc.symbol_table.as_ref()
+                        && let Some(symbol) = symbol_table.lookup_in_class(&type_name, &symbol_name)
+                    {
+                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: uri.clone(),
+                            range: span_to_range(&symbol.span),
+                        })));
+                    }
+                    if let Some(occ) = find_member_in_hierarchy(&type_name, &symbol_name, index)
+                        && let Ok(url) = Url::parse(&occ.uri)
+                    {
+                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: url,
+                            range: span_to_range(&occ.symbol.span),
+                        })));
+                    }
+                }
+            }
+            // A member access we couldn't resolve — don't fall through to a
+            // same-named global or unrelated member.
+            return Ok(None);
+        }
+
+        // 2. Bare identifier: the enclosing class (and ancestors), then globals.
         if let Some(class) = doc
             .program
             .as_ref()
@@ -975,33 +1072,31 @@ impl LanguageServer for Backend {
             }
         }
 
-        // 1. Local: current document's symbol table (globals).
+        // 3. Local: current document's symbol table (globals).
         if let Some(symbol_table) = doc.symbol_table.as_ref()
             && let Some(symbol) = symbol_table.lookup(&symbol_name)
         {
-            let location = Location {
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                 uri: uri.clone(),
                 range: span_to_range(&symbol.span),
-            };
-            return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+            })));
         }
 
-        // 2. Cross-file: global index (prefer a definition in another file).
+        // 4. Cross-file: a global symbol (class/enum/function/variable). Only in
+        //    lenient mode do we also fall back to a same-named member of another class.
         if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
             let matches = index.lookup(&symbol_name);
             let best = matches
                 .iter()
-                .find(|m| m.uri != uri_str && is_definition_kind(&m.symbol.kind))
-                .or_else(|| matches.iter().find(|m| m.uri != uri_str))
-                .or_else(|| matches.first());
+                .find(|m| is_definition_kind(&m.symbol.kind))
+                .or_else(|| if lenient { matches.first() } else { None });
             if let Some(m) = best
                 && let Ok(url) = Url::parse(&m.uri)
             {
-                let location = Location {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                     uri: url,
                     range: span_to_range(&m.symbol.span),
-                };
-                return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                })));
             }
         }
 

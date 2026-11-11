@@ -143,6 +143,9 @@ pub struct SemanticAnalyzer {
     warnings: Vec<String>,
     class_hierarchy: HashMap<String, Option<String>>, // class -> parent class
     global_env: GlobalEnvironment,
+    /// Lenient member scoping: treat a bare name as defined if it's a member of
+    /// *any* class (default false — strict namespace model).
+    lenient_member_scope: bool,
 }
 
 /// Cross-file symbol environment: globals, class hierarchy and members, used to
@@ -187,11 +190,16 @@ impl SemanticAnalyzer {
             warnings: Vec::new(),
             class_hierarchy: HashMap::new(),
             global_env: GlobalEnvironment::default(),
+            lenient_member_scope: false,
         }
     }
 
     pub fn set_global_environment(&mut self, env: GlobalEnvironment) {
         self.global_env = env;
+    }
+
+    pub fn set_lenient_member_scope(&mut self, lenient: bool) {
+        self.lenient_member_scope = lenient;
     }
 
     pub fn analyze(&mut self, program: &Program) -> Result<(), Vec<String>> {
@@ -612,16 +620,19 @@ impl SemanticAnalyzer {
                 // Check if identifier is defined
                 if self.symbol_table.lookup(name).is_none() {
                     // Resolve cross-file: a known global, or a member inherited
-                    // from an ancestor — or (leniently) a member of any class,
-                    // so a broken inheritance chain doesn't flood "undefined".
+                    // from an ancestor. A bare name that is a member of an
+                    // *unrelated* class is undefined (strict namespace model),
+                    // unless `lenient_member_scope` opts back into the
+                    // "member of any class" fallback.
                     let known_global = self.global_env.globals.contains(name);
                     let inherited = self
                         .symbol_table
                         .current_class
                         .as_deref()
                         .is_some_and(|c| self.global_env.has_member(c, name));
-                    let known_member = self.global_env.all_members.contains(name);
-                    if !name.contains('.') && !known_global && !inherited && !known_member {
+                    let lenient_known = self.lenient_member_scope
+                        && self.global_env.all_members.contains(name);
+                    if !name.contains('.') && !known_global && !inherited && !lenient_known {
                         self.warnings.push(format!(
                             "Undefined identifier '{}' at line {}",
                             name, span.start.line
@@ -892,6 +903,49 @@ class A
             !warnings.iter().any(|w| w.contains("Undefined member")),
             "unexpected undefined member warning: {:?}",
             warnings
+        );
+    }
+
+    #[test]
+    fn test_lenient_member_scope() {
+        // A bare `Foo` that is a member of an unrelated class is undefined in
+        // strict mode, but "known" when `lenient_member_scope` is enabled.
+        let code = r#"
+class A
+{
+    void Bar()
+    {
+        Foo();
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut env = GlobalEnvironment::default();
+        env.all_members.insert("Foo".to_string());
+
+        // Strict (default): `Foo` is undefined.
+        let mut analyzer = SemanticAnalyzer::new();
+        analyzer.set_global_environment(env.clone());
+        let _ = analyzer.analyze(&program);
+        assert!(
+            analyzer.get_warnings().iter().any(|w| w.contains("Undefined identifier 'Foo'")),
+            "expected undefined 'Foo' in strict mode, got: {:?}",
+            analyzer.get_warnings()
+        );
+
+        // Lenient: `Foo` is considered known (member of some class).
+        let mut analyzer = SemanticAnalyzer::new();
+        analyzer.set_global_environment(env.clone());
+        analyzer.set_lenient_member_scope(true);
+        let _ = analyzer.analyze(&program);
+        assert!(
+            !analyzer.get_warnings().iter().any(|w| w.contains("Undefined identifier 'Foo'")),
+            "unexpected undefined 'Foo' in lenient mode: {:?}",
+            analyzer.get_warnings()
         );
     }
 
