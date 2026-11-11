@@ -57,7 +57,7 @@ pub enum TypeRef {
 }
 
 /// Base name of a type reference: `array<EffectArea>` → `array`, `int` → `int`.
-fn type_ref_base_name(t: &TypeRef) -> String {
+pub fn type_ref_base_name(t: &TypeRef) -> String {
     match t {
         TypeRef::Primitive(n) => n.clone(),
         TypeRef::Class(n) => n.clone(),
@@ -1125,7 +1125,11 @@ impl Parser {
         self.position = start_pos; // Backtrack
         let start = Position::from_token(self.current());
         let expression = self.parse_expression()?;
-        self.consume(&TokenType::Semicolon, "Expected ';'")?;
+        // Tolerate a missing `;` when the statement is incomplete (e.g. `this.`
+        // while the editor awaits a member name) — the next token is `}` or EOF.
+        if !self.check(&TokenType::RightBrace) && !self.is_at_end() {
+            self.consume(&TokenType::Semicolon, "Expected ';'")?;
+        }
         let end = Position::from_token(self.previous().unwrap());
 
         Ok(Statement::Expression {
@@ -1757,7 +1761,17 @@ impl Parser {
             } else if self.match_token(&[TokenType::Dot]) {
                 // `.!` — a negated member access: `obj.!Method()` == `!obj.Method()`.
                 let negate = self.match_token(&[TokenType::Not]);
-                let member = self.consume_identifier("Expected member name")?;
+                // Tolerate an incomplete member access (`obj.` with no member typed
+                // yet, e.g. while the editor is awaiting completion): use an empty
+                // member name instead of failing the whole statement.
+                let member = if matches!(
+                    self.current_opt().map(|t| &t.token_type),
+                    Some(TokenType::Identifier(_)) | Some(TokenType::Default)
+                ) {
+                    self.consume_identifier("Expected member name")?
+                } else {
+                    String::new()
+                };
                 let start = expr.span().start.clone();
                 let end = Position::from_token(self.previous().unwrap());
                 let mut result = Expression::MemberAccess {

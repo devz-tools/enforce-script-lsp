@@ -10,7 +10,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use crate::lexer::Lexer;
 use crate::index::SymbolIndex;
 use crate::lint::{lint, LintConfig, LintIssue};
-use crate::parser::{Class, Declaration, Parser, Program};
+use crate::parser::{type_ref_base_name, Class, Declaration, Parser, Program};
 use crate::semantic::{SemanticAnalyzer, SymbolKind, SymbolTable};
 use crate::workspace::Workspace;
 
@@ -151,7 +151,15 @@ impl Backend {
             .await;
     }
 
-    fn get_completions(&self, uri: &str, _position: Position) -> Vec<CompletionItem> {
+    fn get_completions(&self, uri: &str, position: Position) -> Vec<CompletionItem> {
+        // Member access: `obj.` → offer the members of `obj`'s type (not everything).
+        if let Some(doc) = self.documents.get(uri) {
+            let member_items = self.member_completions(&doc, position);
+            if !member_items.is_empty() {
+                return member_items;
+            }
+        }
+
         let mut items = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
@@ -233,6 +241,39 @@ impl Backend {
         }
 
         items
+    }
+
+    /// Member access completion: `obj.` resolves `obj`'s type and offers its
+    /// fields/methods (including inherited), instead of returning everything.
+    fn member_completions(&self, doc: &DocumentData, position: Position) -> Vec<CompletionItem> {
+        let Some((object, partial)) = find_member_context(&doc.text, position) else {
+            return Vec::new();
+        };
+
+        let index_guard = self.symbol_index.read().unwrap();
+        let Some(index) = index_guard.as_ref() else {
+            return Vec::new();
+        };
+
+        // Resolve the object's type name.
+        let type_name = if object == "this" || object == "super" {
+            let enclosing = doc
+                .program
+                .as_ref()
+                .and_then(|p| enclosing_class(p, position));
+            match (object.as_str(), enclosing) {
+                ("super", Some(class)) => index.class_parents.get(&class).cloned().flatten(),
+                (_, Some(class)) => Some(class),
+                _ => None,
+            }
+        } else {
+            resolve_type_name(&object, doc, index)
+        };
+        let Some(type_name) = type_name else {
+            return Vec::new();
+        };
+
+        collect_members(&type_name, index, doc, &partial)
     }
 
     fn get_hover(&self, uri: &str, position: Position) -> Option<Hover> {
@@ -544,6 +585,156 @@ fn find_symbol_at_position(text: &str, position: Position) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Detect a member-access completion context `obj.<partial>` at `position`.
+/// Returns `(object, partial_member)` where `object` is the trailing identifier
+/// before the last `.` and `partial_member` is the (possibly empty) prefix after it.
+fn find_member_context(text: &str, position: Position) -> Option<(String, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let line = *lines.get(position.line as usize)?;
+    let col = position.character as usize;
+    let prefix: String = line.chars().take(col.min(line.len())).collect();
+
+    let dot = prefix.rfind('.')?;
+    let partial = prefix[dot + 1..].trim().to_string();
+
+    // The object is the trailing word (identifier / this / super) before the dot.
+    let before = prefix[..dot].trim_end();
+    let obj_start = before
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let object = &before[obj_start..];
+    if object.is_empty() {
+        return None;
+    }
+
+    // The partial must be empty or a valid identifier prefix.
+    if !partial.is_empty() && !partial.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    Some((object.to_string(), partial))
+}
+
+/// Find the class whose span contains `position` (for `this`/`super` resolution).
+fn enclosing_class(program: &Program, position: Position) -> Option<String> {
+    // LSP lines/characters are 0-based; parser spans are 1-based.
+    let line = position.line as usize + 1;
+    let column = position.character as usize + 1;
+    for decl in &program.declarations {
+        if let Declaration::Class(class) = decl {
+            let start = &class.span.start;
+            let end = &class.span.end;
+            let after_start = line > start.line || (line == start.line && column >= start.column);
+            let before_end = line < end.line || (line == end.line && column <= end.column);
+            if after_start && before_end {
+                return Some(class.name.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Whether `name` is a known class type (has a parent entry or a Class symbol).
+fn is_class_type(name: &str, index: &SymbolIndex) -> bool {
+    if index.class_parents.contains_key(name) {
+        return true;
+    }
+    index
+        .lookup(name)
+        .iter()
+        .any(|occ| occ.symbol.kind == SymbolKind::Class)
+}
+
+/// Resolve the type name of a member-access object (a local/field/parameter with
+/// a class type, or a class name used for static access).
+fn resolve_type_name(object: &str, doc: &DocumentData, index: &SymbolIndex) -> Option<String> {
+    // 1. Object is a field/variable/parameter → its declared type.
+    if let Some(st) = &doc.symbol_table {
+        for s in st.get_all_symbols() {
+            if s.name == object
+                && matches!(
+                    s.kind,
+                    SymbolKind::Field | SymbolKind::Variable | SymbolKind::Parameter
+                )
+                && let Some(t) = &s.type_ref
+            {
+                let name = type_ref_base_name(t);
+                if is_class_type(&name, index) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+
+    // 2. Object is a class name (static member access).
+    if is_class_type(object, index) {
+        return Some(object.to_string());
+    }
+
+    None
+}
+
+/// Collect the members of `type_name` (walking the inheritance chain) as
+/// completion items, filtered by `partial`. Sources: the cross-file index
+/// (for inherited/other-file members) and the current document's symbol table
+/// (for members being edited right now).
+fn collect_members(
+    type_name: &str,
+    index: &SymbolIndex,
+    doc: &DocumentData,
+    partial: &str,
+) -> Vec<CompletionItem> {
+    // Build the ancestry chain (type + all ancestors), guarding against cycles.
+    let mut chain = Vec::new();
+    let mut current = Some(type_name.to_string());
+    let mut guard = 0;
+    while let Some(c) = current {
+        chain.push(c.clone());
+        current = index.class_parents.get(&c).cloned().flatten();
+        guard += 1;
+        if guard > 100 {
+            break;
+        }
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut items = Vec::new();
+
+    // 1. From the cross-file index.
+    for occs in index.by_name.values() {
+        for occ in occs {
+            if matches!(occ.symbol.kind, SymbolKind::Field | SymbolKind::Method)
+                && let Some(parent) = &occ.symbol.parent
+                && chain.contains(parent)
+                && seen.insert(occ.symbol.name.clone())
+            {
+                items.push(symbol_to_completion(&occ.symbol));
+            }
+        }
+    }
+
+    // 2. From the current document (fresh members, in case the file is mid-edit).
+    if let Some(st) = &doc.symbol_table {
+        for s in st.get_all_symbols() {
+            if matches!(s.kind, SymbolKind::Field | SymbolKind::Method)
+                && let Some(parent) = &s.parent
+                && chain.contains(parent)
+                && seen.insert(s.name.clone())
+            {
+                items.push(symbol_to_completion(s));
+            }
+        }
+    }
+
+    // Filter by the partial prefix.
+    if !partial.is_empty() {
+        items.retain(|i| i.label.starts_with(partial));
+    }
+
+    items
 }
 
 #[tower_lsp::async_trait]
@@ -863,4 +1054,66 @@ pub async fn start_server() {
 
     let (service, socket) = LspService::new(Backend::new);
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pos(line: u32, character: u32) -> Position {
+        Position::new(line, character)
+    }
+
+    #[test]
+    fn test_find_member_context_object_dot() {
+        // "obj." — cursor right after the dot.
+        let (object, partial) = find_member_context("obj.", pos(0, 4)).unwrap();
+        assert_eq!(object, "obj");
+        assert_eq!(partial, "");
+    }
+
+    #[test]
+    fn test_find_member_context_partial_member() {
+        // "obj.foo" — cursor after "foo".
+        let (object, partial) = find_member_context("obj.foo", pos(0, 7)).unwrap();
+        assert_eq!(object, "obj");
+        assert_eq!(partial, "foo");
+    }
+
+    #[test]
+    fn test_find_member_context_this() {
+        let (object, partial) = find_member_context("this.", pos(0, 5)).unwrap();
+        assert_eq!(object, "this");
+        assert_eq!(partial, "");
+    }
+
+    #[test]
+    fn test_find_member_context_no_dot() {
+        assert!(find_member_context("player", pos(0, 6)).is_none());
+    }
+
+    #[test]
+    fn test_find_member_context_leading_code() {
+        // "void F() { player." — the object is the identifier right before the dot.
+        let text = "void F() { player.";
+        let col = text.len() as u32; // cursor at end, right after '.'
+        let (object, partial) = find_member_context(text, pos(0, col)).unwrap();
+        assert_eq!(object, "player");
+        assert_eq!(partial, "");
+    }
+
+    #[test]
+    fn test_enclosing_class() {
+        let code = "class A {\n  void F() { this.X(); }\n}\nclass B {\n  void G() {}\n}";
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+        // Line 1 (0-based) is inside class A.
+        let name = enclosing_class(&program, pos(1, 10)).unwrap();
+        assert_eq!(name, "A");
+        // Line 4 is inside class B.
+        let name = enclosing_class(&program, pos(4, 10)).unwrap();
+        assert_eq!(name, "B");
+    }
 }

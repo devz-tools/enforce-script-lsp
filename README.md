@@ -62,6 +62,8 @@ cargo run --release
   - All Enforce Script keywords
   - Symbols from symbol table (classes, methods, fields, variables)
   - Context-aware completions
+  - Member completion after `.` — resolves `obj.` (or `this.`/`super.`) to the type and offers
+    its fields/methods, including inherited ones
 
 - **Hover Information** - Rich symbol information on hover
   - Symbol type and kind display
@@ -275,12 +277,15 @@ The implementation follows the official Enforce Script syntax as documented in `
 
 - **`references` (find references)** is still per-document — cross-file needs an index of
   *usages*, not just definitions.
-- **Member completion after `.`** — completion returns everything; `obj.` should resolve the
-  type and offer its members.
-- **`modded class` merging** — `modded class X` is not yet merged into the base `class X`
-  (needed to resolve members of vanilla classes we extend). This surfaces as
-  `Symbol 'X' already defined` for classes declared across multiple files (a per-file scope
-  limitation, not a parser gap).
+- **Member completion after `.`** — resolves `obj.`/`this.`/`super.` for a local/field/parameter
+  with a class type, a class name (static access), and the enclosing class. It does not yet
+  resolve the return type of a method call (`GetWeapon().`) or primitive members
+  (`vector.Zero`).
+- **`modded class` merging** — the members of `modded class X` are indexed under `X` (so they
+  resolve), but `class_parents` is not merged: a `modded class X` without `extends` overwrites
+  the base `class X : Parent`, breaking the inheritance chain. Separately, `Symbol 'X' already
+  defined` is a per-file scope error (the same name declared twice in one file — e.g. a global
+  function overload), not a cross-file merge issue.
 - **C++ natives** — engine-only symbols (e.g. a native method with no script declaration) are
   reported as `undefined identifier` (a warning, not an error). There's no hardcoded "known
   engine globals" list yet.

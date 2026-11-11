@@ -59,6 +59,9 @@ enforce-script-lsp/
   - Template types (array<T>, map<K,V>), including nested generics (`map<string, ref array<int>>`)
   - `[attr]` registration attributes, `(ClassName)expr`/`(Type){...}` casts, `.!` negated
     member access, compound assignment (`^=`), and the `default` soft keyword.
+  - Tolerates incomplete code while the editor awaits completion: an incomplete member access
+    (`obj.` with no member yet) yields an empty member name, and an expression statement may
+    omit the trailing `;` before `}`/EOF.
 
 ### 3. Semantic Analyzer (`src/semantic.rs`)
 - **Purpose**: Builds symbol tables and performs semantic analysis
@@ -131,7 +134,8 @@ did_open(file)
 
 ### Core Features (Implemented)
 - **Diagnostics** - Real-time error and warning detection with accurate line/column positions
-- **Completion** - IntelliSense for classes, methods, variables, and Enforce Script keywords
+- **Completion** - IntelliSense for classes, methods, variables, and Enforce Script keywords;
+  `obj.`/`this.`/`super.` resolves the type and offers its members (fields/methods, incl. inherited)
 - **Hover Information** - Display symbol types, kinds, and definitions with Markdown formatting
 - **Go to Definition** - Navigate to symbol definitions using symbol table lookups (cross-file)
 - **Find References** - Find all occurrences of symbols in the current document
