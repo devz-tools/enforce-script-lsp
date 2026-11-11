@@ -11,7 +11,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use crate::lexer::Lexer;
 use crate::index::{IndexedSymbol, SymbolIndex};
 use crate::lint::{lint, LintConfig, LintIssue};
-use crate::parser::{type_ref_base_name, Class, Declaration, Parser, Program};
+use crate::parser::{type_ref_base_name, Class, Declaration, Parser, Program, Span};
 use crate::semantic::{SemanticAnalyzer, Symbol, SymbolKind, SymbolTable};
 use crate::workspace::Workspace;
 
@@ -289,12 +289,17 @@ impl Backend {
             }
         }
 
-        // 3. Local variables/parameters (visible within the current method).
-        if let Some(doc) = self.documents.get(uri)
-            && let Some(st) = doc.symbol_table.as_ref()
-        {
+        // 3. Local variables/parameters of the enclosing method (span-scoped).
+        let doc = self.documents.get(uri);
+        let method_span = doc
+            .as_ref()
+            .and_then(|d| d.program.as_ref())
+            .and_then(|p| enclosing_method(p, position));
+        let symbol_table = doc.as_ref().and_then(|d| d.symbol_table.as_ref());
+        if let (Some(method_span), Some(st)) = (method_span, symbol_table) {
             for s in st.get_all_symbols() {
                 if matches!(s.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                    && span_within(&method_span, &s.span)
                     && seen.insert(s.name.clone())
                 {
                     items.push(symbol_to_completion(s));
@@ -740,19 +745,52 @@ fn find_member_context(text: &str, position: Position) -> Option<(String, String
 }
 
 /// Find the class whose span contains `position` (for `this`/`super` resolution).
+/// Whether the 1-based `(line, column)` position lies within `span` (inclusive).
+fn span_contains(span: &Span, line: usize, column: usize) -> bool {
+    let after_start = line > span.start.line || (line == span.start.line && column >= span.start.column);
+    let before_end = line < span.end.line || (line == span.end.line && column <= span.end.column);
+    after_start && before_end
+}
+
+/// Whether `inner` lies entirely within `outer` (line-based; parser spans are 1-based).
+fn span_within(outer: &Span, inner: &Span) -> bool {
+    inner.start.line >= outer.start.line && inner.end.line <= outer.end.line
+}
+
 fn enclosing_class(program: &Program, position: Position) -> Option<String> {
     // LSP lines/characters are 0-based; parser spans are 1-based.
     let line = position.line as usize + 1;
     let column = position.character as usize + 1;
     for decl in &program.declarations {
         if let Declaration::Class(class) = decl {
-            let start = &class.span.start;
-            let end = &class.span.end;
-            let after_start = line > start.line || (line == start.line && column >= start.column);
-            let before_end = line < end.line || (line == end.line && column <= end.column);
-            if after_start && before_end {
+            if span_contains(&class.span, line, column) {
                 return Some(class.name.clone());
             }
+        }
+    }
+    None
+}
+
+/// Find the method (or module-level function) whose span contains `position`, so
+/// local variables can be scoped to their enclosing method.
+fn enclosing_method(program: &Program, position: Position) -> Option<Span> {
+    let line = position.line as usize + 1;
+    let column = position.character as usize + 1;
+    for decl in &program.declarations {
+        match decl {
+            Declaration::Class(class) => {
+                for method in &class.methods {
+                    if span_contains(&method.span, line, column) {
+                        return Some(method.span.clone());
+                    }
+                }
+            }
+            Declaration::Function(method) => {
+                if span_contains(&method.span, line, column) {
+                    return Some(method.span.clone());
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -1333,6 +1371,24 @@ mod tests {
         // Line 4 is inside class B.
         let name = enclosing_class(&program, pos(4, 10)).unwrap();
         assert_eq!(name, "B");
+    }
+
+    #[test]
+    fn test_enclosing_method() {
+        let code = "class A {\n  void F() {\n    int x;\n  }\n  void G() {\n    int y;\n  }\n}";
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        // Line 2 (0-based) is inside method F.
+        let m = enclosing_method(&program, pos(2, 5)).unwrap();
+        assert_eq!(m.start.line, 2); // F() spans lines 2..4 (1-based)
+        // Line 5 (0-based) is inside method G.
+        let m = enclosing_method(&program, pos(5, 5)).unwrap();
+        assert_eq!(m.start.line, 5);
+        // Line 0 (0-based) is the class header, not inside any method.
+        assert!(enclosing_method(&program, pos(0, 5)).is_none());
     }
 
     #[test]
