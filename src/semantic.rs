@@ -210,7 +210,12 @@ impl SemanticAnalyzer {
                 Declaration::Variable(field) => {
                     self.register_global_variable(field)?;
                 }
-                Declaration::Function(_) => {} // Handle in second pass
+                Declaration::Function(function) => {
+                    // Register module-level functions up front so forward
+                    // references resolve (e.g. `Class.Func()` before `Func`'s
+                    // declaration). The body is analyzed in the second pass.
+                    self.register_method(function, None)?;
+                }
             }
         }
 
@@ -221,7 +226,8 @@ impl SemanticAnalyzer {
                     self.analyze_class(class)?;
                 }
                 Declaration::Function(function) => {
-                    self.analyze_function(function)?;
+                    // Already registered in the first pass; analyze the body now.
+                    self.analyze_method_body(function, None)?;
                 }
                 _ => {}
             }
@@ -385,11 +391,6 @@ impl SemanticAnalyzer {
         self.symbol_table.exit_scope();
         self.symbol_table.current_class = None;
         Ok(())
-    }
-
-    fn analyze_function(&mut self, function: &Method) -> Result<(), Vec<String>> {
-        self.register_method(function, None)?;
-        self.analyze_method_body(function, None)
     }
 
     fn register_method(
@@ -647,11 +648,20 @@ impl SemanticAnalyzer {
             }
             Expression::MemberAccess {
                 object,
-                member: _,
-                span: _,
+                member,
+                span,
             } => {
                 self.analyze_expression(object)?;
-                // TODO: Check if member exists on object type
+                // A module-level function called as a static member (`Class.Func()`)
+                // is a mistake — flag it.
+                if let Some(class) = self.resolve_static_class(object)
+                    && self.is_global_function(member)
+                {
+                    self.warnings.push(format!(
+                        "Undefined member '{}' on type '{}' at line {}",
+                        member, class, span.start.line
+                    ));
+                }
             }
             Expression::Index { object, index, .. } => {
                 self.analyze_expression(object)?;
@@ -686,6 +696,26 @@ impl SemanticAnalyzer {
             }
         }
         false
+    }
+
+    /// If `object` is a class name (static access `Class.member`), return the
+    /// class name. `this`/`super`, variables, and enums are not static access.
+    fn resolve_static_class(&self, object: &Expression) -> Option<String> {
+        if let Expression::Identifier(name, _) = object {
+            let symbol = self.symbol_table.lookup(name)?;
+            if symbol.kind == SymbolKind::Class {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+
+    /// Whether `member` is a module-level function (a global, not a class member).
+    /// Calling such a function as `Class.Member()` is a mistake.
+    fn is_global_function(&self, member: &str) -> bool {
+        self.symbol_table
+            .lookup(member)
+            .is_some_and(|s| s.kind == SymbolKind::Function && s.parent.is_none())
     }
 }
 
@@ -802,6 +832,67 @@ void Test()
         let _ = analyzer.analyze(&program);
 
         assert!(!analyzer.get_warnings().is_empty());
+    }
+
+    #[test]
+    fn test_undefined_member() {
+        // A module-level function called as a class member should be flagged.
+        let code = r#"
+class A
+{
+    void Bar()
+    {
+        A.Foo();
+    }
+}
+
+void Foo()
+{
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        let warnings = analyzer.get_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("Undefined member 'Foo'")),
+            "expected undefined member warning, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_defined_member_not_flagged() {
+        // A member that exists on the class should not be flagged.
+        let code = r#"
+class A
+{
+    void Foo() {}
+    void Bar()
+    {
+        A.Foo();
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        let warnings = analyzer.get_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.contains("Undefined member")),
+            "unexpected undefined member warning: {:?}",
+            warnings
+        );
     }
 
     #[test]
