@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::lexer::Lexer;
-use crate::index::SymbolIndex;
+use crate::index::{IndexedSymbol, SymbolIndex};
 use crate::lint::{lint, LintConfig, LintIssue};
 use crate::parser::{type_ref_base_name, Class, Declaration, Parser, Program};
 use crate::semantic::{SemanticAnalyzer, SymbolKind, SymbolTable};
@@ -277,14 +277,29 @@ impl Backend {
     }
 
     fn get_hover(&self, uri: &str, position: Position) -> Option<Hover> {
-        let symbol_name = self
-            .documents
-            .get(uri)
-            .and_then(|doc| find_symbol_at_position(&doc.text, position))?;
+        let doc = self.documents.get(uri)?;
+        let symbol_name = find_symbol_at_position(&doc.text, position)?;
+
+        // Resolve as a member of the enclosing class (field/method), incl. inherited.
+        if let Some(class) = doc
+            .program
+            .as_ref()
+            .and_then(|p| enclosing_class(p, position))
+        {
+            if let Some(symbol_table) = doc.symbol_table.as_ref()
+                && let Some(symbol) = symbol_table.lookup_in_class(&class, &symbol_name)
+            {
+                return Some(symbol_to_hover(symbol));
+            }
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref()
+                && let Some(occ) = find_member_in_hierarchy(&class, &symbol_name, index)
+            {
+                return Some(symbol_to_hover(&occ.symbol));
+            }
+        }
 
         // Local symbol table.
-        if let Some(doc) = self.documents.get(uri)
-            && let Some(ref symbol_table) = doc.symbol_table
+        if let Some(symbol_table) = doc.symbol_table.as_ref()
             && let Some(symbol) = symbol_table.lookup(&symbol_name)
         {
             return Some(symbol_to_hover(symbol));
@@ -735,6 +750,31 @@ fn collect_members(
     items
 }
 
+/// Find the member `name` declared in `class` or any of its ancestors (walking
+/// `class_parents`). Used to resolve a field/method to its definition, including
+/// inherited members that live in another file.
+fn find_member_in_hierarchy<'a>(
+    class: &str,
+    name: &str,
+    index: &'a SymbolIndex,
+) -> Option<&'a IndexedSymbol> {
+    let mut chain = Vec::new();
+    let mut current = Some(class.to_string());
+    let mut guard = 0;
+    while let Some(c) = current {
+        chain.push(c.clone());
+        current = index.class_parents.get(&c).cloned().flatten();
+        guard += 1;
+        if guard > 100 {
+            break;
+        }
+    }
+    index
+        .lookup(name)
+        .iter()
+        .find(|occ| occ.symbol.parent.as_ref().is_some_and(|p| chain.contains(p)))
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
@@ -896,21 +936,44 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
         let uri_str = uri.to_string();
 
-        let symbol_name = self
-            .documents
-            .get(&uri_str)
-            .and_then(|doc| find_symbol_at_position(&doc.text, position));
-        let Some(symbol_name) = symbol_name else {
+        let Some(doc) = self.documents.get(&uri_str) else {
+            return Ok(None);
+        };
+        let Some(symbol_name) = find_symbol_at_position(&doc.text, position) else {
             return Ok(None);
         };
 
-        // 1. Local: current document's symbol table.
-        if let Some(doc) = self.documents.get(&uri_str)
-            && let Some(ref symbol_table) = doc.symbol_table
+        // Resolve as a member of the enclosing class (field/method), incl. inherited.
+        if let Some(class) = doc
+            .program
+            .as_ref()
+            .and_then(|p| enclosing_class(p, position))
+        {
+            if let Some(symbol_table) = doc.symbol_table.as_ref()
+                && let Some(symbol) = symbol_table.lookup_in_class(&class, &symbol_name)
+            {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: uri.clone(),
+                    range: span_to_range(&symbol.span),
+                })));
+            }
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref()
+                && let Some(occ) = find_member_in_hierarchy(&class, &symbol_name, index)
+                && let Ok(url) = Url::parse(&occ.uri)
+            {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: url,
+                    range: span_to_range(&occ.symbol.span),
+                })));
+            }
+        }
+
+        // 1. Local: current document's symbol table (globals).
+        if let Some(symbol_table) = doc.symbol_table.as_ref()
             && let Some(symbol) = symbol_table.lookup(&symbol_name)
         {
             let location = Location {
-                uri,
+                uri: uri.clone(),
                 range: span_to_range(&symbol.span),
             };
             return Ok(Some(GotoDefinitionResponse::Scalar(location)));
@@ -1132,5 +1195,36 @@ mod tests {
         // "бот_идёт" starts at char 3 ("// "), cursor in the middle.
         let name = find_symbol_at_position(text, pos(0, 5)).unwrap();
         assert_eq!(name, "бот_идёт");
+    }
+
+    #[test]
+    fn test_find_member_in_hierarchy() {
+        use crate::parser::{Position, Span};
+
+        let mut index = SymbolIndex::default();
+        index
+            .class_parents
+            .insert("Child".to_string(), Some("Base".to_string()));
+        index.by_name.insert(
+            "m_value".to_string(),
+            vec![IndexedSymbol {
+                uri: "file:///base.c".to_string(),
+                symbol: crate::semantic::Symbol {
+                    name: "m_value".to_string(),
+                    kind: SymbolKind::Field,
+                    type_ref: None,
+                    span: Span::new(Position::new(1, 1, 0), Position::new(1, 2, 1)),
+                    scope: 0,
+                    modifiers: Vec::new(),
+                    parent: Some("Base".to_string()),
+                },
+            }],
+        );
+
+        // A member inherited from `Base` resolves for `Child` (walk the hierarchy).
+        let found = find_member_in_hierarchy("Child", "m_value", &index).unwrap();
+        assert_eq!(found.symbol.parent.as_deref(), Some("Base"));
+        // Not part of the hierarchy → None.
+        assert!(find_member_in_hierarchy("Unrelated", "m_value", &index).is_none());
     }
 }
