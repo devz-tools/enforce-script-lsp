@@ -352,6 +352,7 @@ pub struct Parser {
     tokens: Vec<Token>,
     position: usize,
     errors: Vec<String>,
+    warnings: Vec<String>,
 }
 
 impl Parser {
@@ -360,6 +361,7 @@ impl Parser {
             tokens,
             position: 0,
             errors: Vec::new(),
+            warnings: Vec::new(),
         };
         parser.skip_comments();
         parser
@@ -384,6 +386,10 @@ impl Parser {
 
     pub fn get_errors(&self) -> &[String] {
         &self.errors
+    }
+
+    pub fn get_warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     fn parse_declaration(&mut self) -> Result<Declaration, String> {
@@ -734,10 +740,7 @@ impl Parser {
         // Capture the ';' position explicitly (not `previous()`, which `advance()`
         // may move past a following comment).
         let end = Position::from_token(self.current());
-        self.consume(
-            &TokenType::Semicolon,
-            "Expected ';' after field declaration",
-        )?;
+        self.consume_semicolon_or_asi();
 
         let span = Span::new(start, end);
 
@@ -826,7 +829,7 @@ impl Parser {
         let type_ref = self.parse_type()?;
         let name = self.consume_identifier("Expected typedef name")?;
 
-        self.consume(&TokenType::Semicolon, "Expected ';'")?;
+        self.consume_semicolon_or_asi();
 
         let end = Position::from_token(self.previous().unwrap());
         let span = Span::new(start, end);
@@ -1045,12 +1048,12 @@ impl Parser {
             self.parse_return_statement()
         } else if self.match_token(&[TokenType::Break]) {
             let start = Position::from_token(self.previous().unwrap());
-            self.consume(&TokenType::Semicolon, "Expected ';'")?;
+            self.consume_semicolon_or_asi();
             let end = Position::from_token(self.previous().unwrap());
             Ok(Statement::Break(Span::new(start, end)))
         } else if self.match_token(&[TokenType::Continue]) {
             let start = Position::from_token(self.previous().unwrap());
-            self.consume(&TokenType::Semicolon, "Expected ';'")?;
+            self.consume_semicolon_or_asi();
             let end = Position::from_token(self.previous().unwrap());
             Ok(Statement::Continue(Span::new(start, end)))
         } else if self.match_token(&[TokenType::Delete]) {
@@ -1109,7 +1112,7 @@ impl Parser {
                 }
             }
 
-            self.consume(&TokenType::Semicolon, "Expected ';'")?;
+            self.consume_semicolon_or_asi();
             let end = Position::from_token(self.previous().unwrap());
 
             return Ok(Statement::VariableDeclaration {
@@ -1128,7 +1131,7 @@ impl Parser {
         // Tolerate a missing `;` when the statement is incomplete (e.g. `this.`
         // while the editor awaits a member name) — the next token is `}` or EOF.
         if !self.check(&TokenType::RightBrace) && !self.is_at_end() {
-            self.consume(&TokenType::Semicolon, "Expected ';'")?;
+            self.consume_semicolon_or_asi();
         }
         let end = Position::from_token(self.previous().unwrap());
 
@@ -1368,7 +1371,7 @@ impl Parser {
         } else {
             None
         };
-        self.consume(&TokenType::Semicolon, "Expected ';'")?;
+        self.consume_semicolon_or_asi();
 
         let increment = if !self.check(&TokenType::RightParen) {
             Some(self.parse_expression()?)
@@ -1456,7 +1459,7 @@ impl Parser {
             None
         };
 
-        self.consume(&TokenType::Semicolon, "Expected ';'")?;
+        self.consume_semicolon_or_asi();
         let end = Position::from_token(self.previous().unwrap());
 
         Ok(Statement::Return {
@@ -1468,7 +1471,7 @@ impl Parser {
     fn parse_delete_statement(&mut self) -> Result<Statement, String> {
         let start = Position::from_token(self.previous().unwrap());
         let expression = self.parse_expression()?;
-        self.consume(&TokenType::Semicolon, "Expected ';'")?;
+        self.consume_semicolon_or_asi();
         let end = Position::from_token(self.previous().unwrap());
 
         Ok(Statement::Delete {
@@ -2125,6 +2128,21 @@ impl Parser {
         }
     }
 
+    /// Consume an optional statement terminator `;`. If it is missing (automatic
+    /// semicolon insertion at end of line / before `}` / EOF), record a warning
+    /// instead of a hard error — the engine tolerates a missing `;` here.
+    fn consume_semicolon_or_asi(&mut self) {
+        if self.check(&TokenType::Semicolon) {
+            self.advance();
+            return;
+        }
+        let line = self
+            .previous()
+            .map(|t| t.line)
+            .unwrap_or_else(|| self.current().line);
+        self.warnings.push(format!("Missing ';' at line {}", line));
+    }
+
     /// Skip a `[...]` group (used for `[ClassName(...)]` registration attributes),
     /// handling nested brackets. Assumes the current token is `[`.
     fn skip_bracketed_group(&mut self) {
@@ -2698,6 +2716,35 @@ class dmCampCoverFinder
         let result = parser.parse();
 
         assert!(result.is_ok(), "nested generics parse error: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_asi_missing_semicolon() {
+        // A `break` without a trailing `;` (automatic semicolon insertion) must
+        // parse and produce a warning, not a hard error.
+        let code = r#"
+void F()
+{
+    switch (x)
+    {
+        case 1:
+            break
+        case 2:
+            break;
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(parser.get_errors().is_empty(), "errors: {:?}", parser.get_errors());
+        assert!(
+            parser.get_warnings().iter().any(|w| w.contains("Missing ';'")),
+            "expected missing-; warning, got: {:?}",
+            parser.get_warnings()
+        );
     }
 
     #[test]

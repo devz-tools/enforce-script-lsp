@@ -68,6 +68,10 @@ impl Backend {
                 for error in parser.get_errors() {
                     diagnostics.push(create_diagnostic(error.clone(), DiagnosticSeverity::ERROR));
                 }
+                // Missing-`;` automatic-semicolon-insertion warnings.
+                for warning in parser.get_warnings() {
+                    diagnostics.push(create_diagnostic(warning.clone(), DiagnosticSeverity::WARNING));
+                }
                 Some(prog)
             }
             Err(e) => {
@@ -76,6 +80,9 @@ impl Backend {
                 // Also collect any accumulated errors
                 for error in parser.get_errors() {
                     diagnostics.push(create_diagnostic(error.clone(), DiagnosticSeverity::ERROR));
+                }
+                for warning in parser.get_warnings() {
+                    diagnostics.push(create_diagnostic(warning.clone(), DiagnosticSeverity::WARNING));
                 }
                 None
             }
