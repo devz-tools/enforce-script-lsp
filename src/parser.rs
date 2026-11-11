@@ -798,9 +798,11 @@ impl Parser {
                 span: Span::new(variant_start, variant_end),
             });
 
-            if !self.match_token(&[TokenType::Comma]) {
-                break;
-            }
+            // Consume the optional comma. Tolerate a missing comma between
+            // variants (some vanilla enums are newline-separated, e.g.
+            // `CMD_ACTIONMOD_WASHFACE` followed directly by the next variant);
+            // the while-loop condition stops at `}`/EOF.
+            self.match_token(&[TokenType::Comma]);
         }
 
         let end_line = self.current().line;
@@ -2293,6 +2295,25 @@ enum MyEnum
         let result = parser.parse();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_enum_missing_comma() {
+        // Some vanilla enums omit the comma between variants (newline-separated),
+        // e.g. `CMD_ACTIONMOD_WASHFACE` followed directly by the next variant.
+        let code = r#"
+enum MyEnum
+{
+    A = 1,
+    B
+    C = 500
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+        assert!(result.is_ok(), "expected missing-comma enum to parse, got {:?}", result);
     }
 
     #[test]
