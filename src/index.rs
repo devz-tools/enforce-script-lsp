@@ -200,6 +200,16 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
                 }
             }
             Declaration::Typedef(typedef) => {
+                // A `typedef ClassName Alias` is a class alias — register the
+                // target in class_parents so the inheritance chain resolves
+                // through the alias (e.g. `typedef ItemBase InventoryItemSuper`,
+                // where `Weapon extends InventoryItemSuper`).
+                if let TypeRef::Class(target) = &typedef.type_ref {
+                    index
+                        .class_parents
+                        .entry(typedef.name.clone())
+                        .or_insert(Some(target.clone()));
+                }
                 index.insert(
                     &uri,
                     Symbol {
