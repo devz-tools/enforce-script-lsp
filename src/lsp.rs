@@ -545,23 +545,21 @@ fn create_diagnostic(message: String, severity: DiagnosticSeverity) -> Diagnosti
 
 /// Find symbol name at given position in text
 fn find_symbol_at_position(text: &str, position: Position) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let line_idx = position.line as usize;
-    let col_idx = position.character as usize;
+    let line = text.lines().nth(position.line as usize)?;
 
-    if line_idx >= lines.len() {
-        return None;
-    }
-
-    let line = lines[line_idx];
-    if col_idx >= line.len() {
+    // Work in character space, not byte space: a byte-index slice into a line
+    // containing multi-byte UTF-8 (e.g. Cyrillic comments) would panic on a
+    // non-char boundary.
+    let chars: Vec<char> = line.chars().collect();
+    let col = position.character as usize;
+    if col >= chars.len() {
         return None;
     }
 
     // Find the start of the identifier
-    let mut start = col_idx;
+    let mut start = col;
     while start > 0 {
-        let ch = line.chars().nth(start - 1)?;
+        let ch = chars[start - 1];
         if ch.is_alphanumeric() || ch == '_' {
             start -= 1;
         } else {
@@ -570,9 +568,9 @@ fn find_symbol_at_position(text: &str, position: Position) -> Option<String> {
     }
 
     // Find the end of the identifier
-    let mut end = col_idx;
-    while end < line.len() {
-        let ch = line.chars().nth(end)?;
+    let mut end = col;
+    while end < chars.len() {
+        let ch = chars[end];
         if ch.is_alphanumeric() || ch == '_' {
             end += 1;
         } else {
@@ -581,7 +579,7 @@ fn find_symbol_at_position(text: &str, position: Position) -> Option<String> {
     }
 
     if start < end {
-        Some(line[start..end].to_string())
+        Some(chars[start..end].iter().collect())
     } else {
         None
     }
@@ -594,7 +592,7 @@ fn find_member_context(text: &str, position: Position) -> Option<(String, String
     let lines: Vec<&str> = text.lines().collect();
     let line = *lines.get(position.line as usize)?;
     let col = position.character as usize;
-    let prefix: String = line.chars().take(col.min(line.len())).collect();
+    let prefix: String = line.chars().take(col).collect();
 
     let dot = prefix.rfind('.')?;
     let partial = prefix[dot + 1..].trim().to_string();
@@ -1115,5 +1113,24 @@ mod tests {
         // Line 4 is inside class B.
         let name = enclosing_class(&program, pos(4, 10)).unwrap();
         assert_eq!(name, "B");
+    }
+
+    #[test]
+    fn test_find_symbol_at_position_cyrillic() {
+        // A line whose identifier is preceded by multi-byte UTF-8 must not panic
+        // and must resolve the identifier (not a byte-index slice).
+        let text = "//! комментарий про бота: m_Weapon.";
+        // "m_Weapon" starts after "//! комментарий про бота: " = 29 chars.
+        let name = find_symbol_at_position(text, pos(0, 32)).unwrap();
+        assert_eq!(name, "m_Weapon");
+    }
+
+    #[test]
+    fn test_find_symbol_at_position_cyrillic_only() {
+        // Identifier that is itself Cyrillic.
+        let text = "// бот_идёт";
+        // "бот_идёт" starts at char 3 ("// "), cursor in the middle.
+        let name = find_symbol_at_position(text, pos(0, 5)).unwrap();
+        assert_eq!(name, "бот_идёт");
     }
 }
