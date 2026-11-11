@@ -500,12 +500,14 @@ impl SemanticAnalyzer {
             Statement::Expression { expression, .. } => {
                 self.analyze_expression(expression)?;
             }
+            // Enforce has no block scope: a variable declared inside any block
+            // (or a for/foreach initializer) is method/function-scoped — visible
+            // from its declaration line to the end of the method, regardless of
+            // `{}` nesting. So blocks do NOT open a new scope.
             Statement::Block { statements, .. } => {
-                self.symbol_table.enter_scope();
                 for stmt in statements {
                     self.analyze_statement(stmt)?;
                 }
-                self.symbol_table.exit_scope();
             }
             Statement::If {
                 condition,
@@ -539,7 +541,6 @@ impl SemanticAnalyzer {
                 body,
                 ..
             } => {
-                self.symbol_table.enter_scope();
                 if let Some(init) = initializer {
                     self.analyze_statement(init)?;
                 }
@@ -550,7 +551,6 @@ impl SemanticAnalyzer {
                     self.analyze_expression(inc)?;
                 }
                 self.analyze_statement(body)?;
-                self.symbol_table.exit_scope();
             }
             Statement::Foreach {
                 key_var,
@@ -559,8 +559,6 @@ impl SemanticAnalyzer {
                 body,
                 ..
             } => {
-                self.symbol_table.enter_scope();
-
                 if let Some((key_type, key_name)) = key_var {
                     let key_symbol = Symbol {
                         name: key_name.clone(),
@@ -592,7 +590,6 @@ impl SemanticAnalyzer {
 
                 self.analyze_expression(iterable)?;
                 self.analyze_statement(body)?;
-                self.symbol_table.exit_scope();
             }
             Statement::While {
                 condition, body, ..
@@ -843,6 +840,45 @@ void Test()
         let _ = analyzer.analyze(&program);
 
         assert!(!analyzer.get_warnings().is_empty());
+    }
+
+    #[test]
+    fn test_for_loop_variable_is_method_scoped() {
+        // Enforce has no block scope: `i` declared in the first `for` initializer
+        // stays visible in a later block (e.g. a different `for` that only
+        // reassigns it), so it must not be flagged "undefined".
+        let code = r#"
+void Test()
+{
+    for (int i = 0; i < 4; i++)
+    {
+        Print(i);
+    }
+    if (true)
+    {
+        for (i = 0; i < 4; i++)
+        {
+            Print(i);
+        }
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        assert!(
+            !analyzer
+                .get_warnings()
+                .iter()
+                .any(|w| w.contains("Undefined identifier 'i'")),
+            "i should be method-scoped, but got: {:?}",
+            analyzer.get_warnings()
+        );
     }
 
     #[test]
