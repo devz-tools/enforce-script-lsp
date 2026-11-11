@@ -1,15 +1,97 @@
-# enforce-script-lsp
+# Enforce Script Language Server
 
-A [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) server for
-**Enforce Script** — the scripting language of the Enfusion engine, used for modding DayZ.
+A comprehensive Language Server Protocol (LSP) implementation for Enforce Script, the scripting language used by the Enfusion game engine and for modding video games such as DayZ.
 
-This is a fork of [`devz-tools/enforce-script-lsp`](https://github.com/devz-tools/enforce-script-lsp),
-extended from a single-file analyzer into a **project-aware** language server: it discovers a
-DayZ mod's `config.cpp` files, indexes the whole project (and, optionally, the vanilla engine
-scripts and other dependency roots), resolves symbols across files and up the inheritance chain,
-and lints for Enforce-specific pitfalls that the engine's own tooling misses.
+This fork extends the upstream single-file analyzer into a **project-aware** language server: it discovers a mod's `config.cpp` files, indexes the whole project (and, optionally, the vanilla engine scripts and other dependency roots), resolves symbols across files and up the inheritance chain, and lints for Enforce-specific pitfalls that the engine's own tooling misses.
+
+## 🚀 Quick Start
+
+```bash
+# Build the project
+cargo build --release
+
+# Run tests
+cargo test
+
+# Start the LSP server
+cargo run --release
+```
+
+## 📚 Documentation
+
+- **[Tutorial](TUTORIAL.md)** - Comprehensive guide to using and extending the LSP
+- **[Contributing](CONTRIBUTING.md)** - Guidelines for contributors
+- **[Syntax Reference](ENFORCE-SCRIPT-SYNTAX.md)** - Complete Enforce Script language specification
+- **[Implementation Details](IMPLEMENTATION.md)** - Architecture and design decisions
+- **[Developer Guide](AGENTS.md)** - Guide for AI agents and developers
 
 ## Features
+
+### ✅ Implemented Features
+
+- **Lexer/Tokenizer** - Complete tokenization of Enforce Script source code
+  - Keywords, operators, literals, identifiers, comments
+  - Support for all Enforce Script syntax elements
+
+- **Parser** - Full AST generation for Enforce Script
+  - Classes (with inheritance, modded classes, templates)
+  - Functions and methods (with modifiers: private, protected, static, override, etc.)
+  - Variables and fields (with modifiers: const, ref, autoptr, etc.)
+  - Enums (with inheritance and custom values)
+  - Control structures (if, else, switch, for, foreach, while)
+  - Expressions (binary, unary, member access, indexing, new, etc.)
+  - Typedefs
+  - Nested generics (`map<string, ref array<int>>`), `[attr]` registration attributes,
+    primitive types as objects/values (`string.Empty`, `!= int`), `Type name();`
+    default-construction, generic base classes (`class X : array<T>`), C-style and class casts,
+    `.!` negated member access, compound assignment (`^=`), and the `default` soft keyword.
+
+- **Semantic Analyzer** - Symbol table and semantic analysis
+  - Symbol resolution across scopes
+  - Class hierarchy tracking
+  - Type inference for variables
+  - Undefined symbol detection
+  - Cross-file resolution of global symbols and inherited members
+
+- **Diagnostics** - Real-time error and warning detection with accurate positions
+  - Syntax errors from parser with line/column information
+  - Semantic errors from analyzer
+  - Undefined variable warnings
+
+- **Completion** - IntelliSense support
+  - All Enforce Script keywords
+  - Symbols from symbol table (classes, methods, fields, variables)
+  - Context-aware completions
+
+- **Hover Information** - Rich symbol information on hover
+  - Symbol type and kind display
+  - Markdown-formatted code blocks
+  - Definition location highlighting
+
+- **Go to Definition** - Navigate to symbol definitions
+  - Jump from usage to definition
+  - Works with classes, functions, methods, variables
+  - Cross-file via the project index
+
+- **Find References** - Find all symbol occurrences
+  - Lists all definitions of a symbol
+  - Document-wide symbol search
+
+- **Signature Help** - Function/method parameter hints
+  - Basic signature information
+  - Shows function names and signatures
+
+- **Document Symbols** - Outline view
+  - Classes with fields and methods
+  - Functions
+  - Enums with variants
+  - Hierarchical symbol tree
+
+- **Folding Ranges** - Code folding support
+  - Classes and methods
+  - Code blocks
+
+### 🧩 Project-aware features (fork additions)
 
 - **config.cpp discovery** — walks the workspace, finds every `config.cpp`, parses
   `dir`/`files[]`/`defines[]`, and derives the set of compiled directories (both the
@@ -18,57 +100,62 @@ and lints for Enforce-specific pitfalls that the engine's own tooling misses.
   module's `files[]` (the classic "forgot to add the directory to config.cpp" footgun).
 - **defines-aware `#ifdef`** — keeps/skips `#ifdef X`/`#ifndef X`/`#else`/`#endif` branches
   according to the module's `defines[]` from `config.cpp`.
-- **Cross-file symbol index** — indexes all compiled `.c` files and powers
-  *go-to-definition*, *completion* and *hover* across files (not just the current document).
-- **Cross-file resolution** — resolves global symbols (enums, classes, functions, constants)
-  and **inherited members** (fields/methods of parent classes) so that e.g. `m_SomeField`
-  in `MyIntent : BaseIntent` is no longer reported as "undefined".
+- **Cross-file symbol index** — indexes all compiled `.c` files and powers go-to-definition,
+  completion and hover across files (not just the current document).
 - **`dependencyRoots`** — indexes extra source roots (the vanilla engine scripts and other
   dependency roots) "lightly" (signatures straight from the AST), so engine globals like
   `Math`, `vector`, `GetGame` resolve too.
-- **Enforce-specific lint** (`lint.rs`):
-  - long `+` chain (string concatenation, >15) — *Formula too complex*;
-  - long `||`/`&&` chain (>8);
-  - ternary operator `cond ? a : b` — not supported by Enforce;
-  - line break after `.` (`A.` newline `B()`);
-  - a variable declared more than once in the same method (Enforce has no block scope);
-  - a field/variable named after a built-in class (`Surface`, `Object`, `Game`, …) — the engine
-    crashes on startup and AddonBuilder doesn't catch it.
+- **Enforce-specific lint** (`lint.rs`) — long `+`/`||`/`&&` chains, ternary operator, line
+  break after `.`, a variable declared more than once in a method, and a field/variable named
+  after a built-in class.
+
+### 🚧 Partially Implemented
+
+- **Workspace Symbols** - Global symbol search (stub implemented)
+- **Go to Implementation** - Navigate to implementations (stub implemented)
+- **Go to Type Definition** - Navigate to type definitions (stub implemented)
+- **Code Actions** - Quick fixes and refactorings (stub implemented)
+- **Rename** - Symbol renaming (stub implemented)
+- **Inlay Hints** - Inline type/parameter hints (stub implemented)
 
 ## Building
 
-Prerequisites: Rust 1.85+ (the crate uses edition 2024).
+### Prerequisites
+
+- Rust 1.85+ (the crate uses edition 2024) (https://rustup.rs/)
+- Cargo (comes with Rust)
+
+### Build Instructions
 
 ```bash
-cargo build --release   # → target/release/enforce-script-lsp
-cargo test              # run the test suite
+# Clone the repository
+git clone <repository-url>
+cd enforce-script-lsp
+
+# Build the project
+cargo build --release
+
+# Run tests
+cargo test
+
+# Run the LSP server
+cargo run --release
 ```
+
+The compiled binary will be available at `target/release/enforce-script-lsp` (or `.exe` on Windows).
 
 ## Usage
 
-The server speaks LSP over stdio. Wire it into an editor:
+The LSP server communicates over stdin/stdout following the Language Server Protocol specification.
 
-### VS Code / Cursor
+### VS Code Integration
 
-`editor/vscode/` contains a small local client. Build and install it:
+To use with VS Code, you'll need to create or update a VS Code extension that uses this LSP server. Example configuration:
 
-```bash
-cd editor/vscode
-npm install
-npx vsce package
-code --install-extension enforce-script-lsp-local-0.1.0.vsix
-```
-
-Settings (workspace `.vscode/settings.json`):
-
-```jsonc
+```json
 {
-  "enforceScriptLsp.serverPath": "/path/to/enforce-script-lsp",
-  "enforceScriptLsp.dependencyRoots": [
-    "/path/to/DayZ/scripts",           // vanilla engine scripts
-    "/path/to/another-mod-Scripts"
-  ],
-  "files.associations": { "*.c": "enforcescript" }
+  "command": "path/to/enforce-script-lsp",
+  "args": []
 }
 ```
 
@@ -125,29 +212,64 @@ ls -li /proc/$(pgrep -f 'enforce-script-lsp --stdio')/exe   # "(deleted)" = stal
 
 ## Architecture
 
-Modules in `src/`:
+### Modules
 
-- **`lexer.rs`** — tokenizer + preprocessor (`#ifdef`/`#ifndef`/`#else`/`#endif` evaluated
-  against active defines; empty set = skip all `#ifdef`).
-- **`parser.rs`** — recursive-descent AST; handles module-level `static const`, C-style casts
-  `(float)x`, expression statements, optional `;` after `class`/`enum`.
-- **`semantic.rs`** — per-file symbol table + `GlobalEnvironment` (globals, class hierarchy,
-  members) used to resolve cross-file identifiers.
-- **`workspace.rs`** — `config.cpp` discovery, prefix map, compiled directories, `defines_for`.
-- **`index.rs`** — cross-file `SymbolIndex`: name → occurrences across the project + deps,
-  plus the class hierarchy.
-- **`lint.rs`** — Enforce-specific lint checks (thresholds in `LintConfig`).
-- **`lsp.rs`** — the tower-lsp `Backend`: captures `rootUri`/`dependencyRoots`, builds the
-  workspace + index, wires diagnostics/completion/hover/go-to-definition to the index.
+- **`lexer.rs`** - Tokenizes Enforce Script source code into tokens (plus the
+  `#ifdef`/`#ifndef`/`#else`/`#endif` preprocessor)
+- **`parser.rs`** - Parses tokens into an Abstract Syntax Tree (AST)
+- **`semantic.rs`** - Performs semantic analysis and builds symbol tables (per-file) +
+  `GlobalEnvironment` for cross-file resolution
+- **`workspace.rs`** - `config.cpp` discovery, prefix map, compiled directories, `defines_for`
+- **`index.rs`** - cross-file `SymbolIndex` (name → occurrences) + class hierarchy
+- **`lint.rs`** - Enforce-specific lint checks
+- **`lsp.rs`** - LSP server implementation using tower-lsp
+- **`main.rs`** - Entry point that starts the LSP server
+
+### Key Data Structures
+
+- `Token` - Represents a lexical token with type, lexeme, and position
+- `Expression` - Represents Enforce Script expressions in the AST
+- `Statement` - Represents Enforce Script statements in the AST
+- `Declaration` - Represents top-level declarations (classes, enums, functions, typedefs)
+- `Symbol` - Represents a symbol in the symbol table with scope and type information
+- `SymbolTable` - Maintains symbols across scopes for semantic analysis
 
 ## Testing
 
+The project includes comprehensive unit tests for all major components:
+
 ```bash
-cargo test                # all
-cargo test lexer::tests   # one module
+# Run all tests
+cargo test
+
+# Run tests with output
+cargo test -- --nocapture
+
+# Run specific test module
+cargo test lexer::tests
+cargo test parser::tests
+cargo test semantic::tests
 ```
 
-Tests are co-located with each module (`#[cfg(test)] mod tests`).
+### Test Coverage
+
+- ✅ Lexer: Keywords, identifiers, numbers, strings, operators, comments
+- ✅ Parser: Classes, enums, functions, expressions, statements
+- ✅ Semantic: Symbol resolution, undefined variable detection
+- ✅ Integration: End-to-end parsing and analysis
+
+## Enforce Script Syntax Reference
+
+The implementation follows the official Enforce Script syntax as documented in `ENFORCE-SCRIPT-SYNTAX.md`, which covers:
+
+- Basic syntax (code blocks, variables, functions, comments)
+- Operators (arithmetic, assignment, relational, logical, bitwise)
+- Keywords and modifiers
+- Types (primitives, objects, enums, templates, arrays)
+- Control structures (if/else, switch, for, foreach, while)
+- Object-oriented features (classes, inheritance, constructors/destructors)
+- Managed classes and automatic reference counting
+- Modding features (modded classes, modded constants)
 
 ## Current limitations / roadmap
 
@@ -165,20 +287,41 @@ Tests are co-located with each module (`#[cfg(test)] mod tests`).
 - The index is built synchronously in `initialized`; fine for a mod, but large dependency
   roots warrant `spawn_blocking`.
 
-### Parser coverage
+## 🤝 Contributing
 
-The parser was validated against real-world DayZ codebases (the vanilla engine scripts plus a
-large mod tree). It handles: nested generics (`map<string, ref array<int>>`), `[attr]`
-registration attributes, primitive types as objects/values (`string.Empty`, `!= int`),
-`Type name();` default-construction, multi-variable declarations, generic base classes
-(`class X : array<T>`), `(ClassName)expr` and `(Type){...}` casts, `.!` negated member access,
-compound assignment (`^=`), `reference`/`event`/`local`/`sealed` modifiers, trailing commas,
-and the `default` soft keyword. Remaining errors on large codebases are mostly genuine source
-bugs (e.g. a missing `;`), not parser gaps.
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-Note: **bitwise operators (`&` `|` `~` `<<` `>>`) are supported in Enforce** — the old claim
-that they give `Unknown operator` was wrong.
+### Priority Areas
+
+1. **Complete LSP Features** - Finish implementing goto definition, find references, rename, etc.
+2. **Enhanced Type Checking** - More sophisticated type inference and checking
+3. **Better Error Recovery** - Improve parser error recovery for better diagnostics
+4. **Performance** - Optimize parsing and semantic analysis for large files
+5. **Documentation** - Add more inline documentation and examples
+6. **Tests** - Expand test coverage for edge cases
+
+### Development
+
+```bash
+# Run tests
+cargo test
+
+# Format code
+cargo fmt
+
+# Run linter
+cargo clippy
+
+# Build documentation
+cargo doc --open
+```
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+See LICENSE file for details.
+
+## Acknowledgments
+
+- Bohemia Interactive for the Enforce Script language specification
+- The tower-lsp library maintainers for the excellent LSP framework
+- The Rust community for the robust tooling ecosystem
