@@ -12,6 +12,13 @@
     "onLanguage:enforcescript"
   ],
   "contributes": {
+    "grammars": [
+      {
+        "language": "enforcescript",
+        "scopeName": "source.enforcescript",
+        "path": "./syntaxes/enforcescript.tmLanguage.json"
+      }
+    ],
     "languages": [
       {
         "id": "enforcescript",
@@ -21,8 +28,7 @@
         "extensions": [
           ".c"
         ],
-        "configuration": "./language-configuration.json",
-        "grammar": "./syntaxes/enforcescript.tmLanguage.json"
+        "configuration": "./language-configuration.json"
       }
     ],
     "configuration": {
