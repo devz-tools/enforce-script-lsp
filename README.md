@@ -2,7 +2,7 @@
 
 A comprehensive Language Server Protocol (LSP) implementation for Enforce Script, the scripting language used by the Enfusion game engine and for modding video games such as DayZ.
 
-This fork extends the upstream single-file analyzer into a **project-aware** language server: it discovers a mod's `config.cpp` files, indexes the whole project (and, optionally, the vanilla engine scripts and other dependency roots), resolves symbols across files and up the inheritance chain, and lints for Enforce-specific pitfalls that the engine's own tooling misses.
+It is a **project-aware** language server: it discovers a mod's `config.cpp` files, indexes the whole project (and, optionally, the vanilla engine scripts and other dependency roots), resolves symbols across files and up the inheritance chain, and lints for Enforce-specific pitfalls that the engine's own tooling misses.
 
 ## 🚀 Quick Start
 
@@ -93,7 +93,7 @@ cargo run --release
   - Classes and methods
   - Code blocks
 
-### 🧩 Project-aware features (fork additions)
+### 🧩 Project-aware features
 
 - **config.cpp discovery** — walks the workspace, finds every `config.cpp`, parses
   `dir`/`files[]`/`defines[]`, and derives the set of compiled directories (both the
@@ -197,11 +197,11 @@ Build, then atomically replace the binary and **restart the running server proce
 
 ```bash
 cargo build --release
-cp target/release/enforce-script-lsp /opt/enf-lsp/enforce-script-lsp.new
-mv /opt/enf-lsp/enforce-script-lsp.new /opt/enf-lsp/enforce-script-lsp
+cp target/release/enforce-script-lsp /path/to/enforce-script-lsp.new
+mv /path/to/enforce-script-lsp.new /path/to/enforce-script-lsp
 # IMPORTANT: the editor/LSP client keeps the OLD inode. Kill the running process so
 # the client relaunches against the fresh binary:
-pkill -f 'enforce-script-lsp --stdio'   # OpenCode relaunches it lazily
+pkill -f 'enforce-script-lsp --stdio'   # the editor relaunches it lazily
 ```
 
 **Why the restart is required.** `mv` swaps the path to a new inode, but a process that
@@ -277,9 +277,8 @@ The implementation follows the official Enforce Script syntax as documented in `
 
 - **`references` (find references)** is still per-document — cross-file needs an index of
   *usages*, not just definitions.
-- **Member completion after `.`** — resolves `obj.`/`this.`/`super.` for a local/field/parameter
-  with a class type, a class name (static access), and the enclosing class. It does not yet
-  resolve the return type of a method call (`GetWeapon().`) or primitive members
+- **Member completion after `.`** — resolves `obj.`/`this.`/`super.` to the type's members, but
+  does not yet resolve the return type of a method call (`GetWeapon().`) or primitive members
   (`vector.Zero`).
 - **`modded class` merging** — the members of `modded class X` are indexed under `X` (so they
   resolve), but `class_parents` is not merged: a `modded class X` without `extends` overwrites

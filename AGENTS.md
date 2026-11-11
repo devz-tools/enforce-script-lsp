@@ -3,7 +3,7 @@
 This project contains an implementation of an LSP (language server protocol) for the Enforce Script programming language used with the Enfusion game engine and for modding video games such as DayZ.
 The LSP is implemented using Rust and the `tower-lsp` library, primarily for use within Visual Studio Code via the `devz-tools` extension.
 
-This fork extends the upstream single-file analyzer into a **project-aware** language server: it discovers a mod's `config.cpp` files, indexes the whole project (and, optionally, the vanilla engine scripts and other dependency roots), and resolves symbols across files and up the inheritance chain.
+It is a **project-aware** language server: it discovers a mod's `config.cpp` files, indexes the whole project (and, optionally, the vanilla engine scripts and other dependency roots), and resolves symbols across files and up the inheritance chain.
 
 ## Project Structure
 
@@ -252,7 +252,7 @@ cargo check
 
 - **After deploying the binary (`cp … .new && mv`), restart the running server process.** `mv`
   swaps the path to a new inode, but an already-running process keeps the old inode in memory.
-  `pkill -f 'enforce-script-lsp --stdio'` — OpenCode relaunches it lazily. Verify with
+  `pkill -f 'enforce-script-lsp --stdio'` — the editor relaunches it lazily. Verify with
   `ls -li /proc/<PID>/exe`: a `(deleted)` suffix means stale.
 
 ## Notes
