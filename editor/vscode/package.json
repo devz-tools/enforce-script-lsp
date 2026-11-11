@@ -21,7 +21,8 @@
         "extensions": [
           ".c"
         ],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "grammar": "./syntaxes/enforcescript.tmLanguage.json"
       }
     ],
     "configuration": {

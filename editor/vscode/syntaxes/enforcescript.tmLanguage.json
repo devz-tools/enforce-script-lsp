@@ -1,0 +1,96 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Enforce Script",
+  "scopeName": "source.enforcescript",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#preprocessor" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#modifiers" },
+    { "include": "#constants" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.enforcescript",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "patterns": [{ "include": "#comments" }]
+        },
+        {
+          "name": "comment.line.double-slash.enforcescript",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.enforcescript",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.enforcescript",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "numbers": {
+      "name": "constant.numeric.enforcescript",
+      "match": "\\b(0[xX][0-9a-fA-F]+|\\d+(\\.\\d+)?([eE][+-]?\\d+)?[fF]?)\\b"
+    },
+    "preprocessor": {
+      "patterns": [
+        {
+          "name": "meta.preprocessor.enforcescript",
+          "begin": "^\\s*(#)",
+          "end": "$",
+          "beginCaptures": {
+            "1": { "name": "punctuation.definition.directive.enforcescript" }
+          },
+          "patterns": [
+            {
+              "name": "keyword.control.directive.enforcescript",
+              "match": "\\b(ifdef|ifndef|else|endif|include|define|undef|pragma|error|warning)\\b"
+            }
+          ]
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.enforcescript",
+          "match": "\\b(if|else|switch|case|default|for|foreach|while|break|continue|return)\\b"
+        },
+        {
+          "name": "keyword.other.enforcescript",
+          "match": "\\b(class|enum|typedef|extends|modded|typename)\\b"
+        },
+        {
+          "name": "keyword.operator.word.enforcescript",
+          "match": "\\b(new|delete)\\b"
+        }
+      ]
+    },
+    "types": {
+      "name": "storage.type.enforcescript",
+      "match": "\\b(void|int|float|bool|string|vector|auto)\\b"
+    },
+    "modifiers": {
+      "name": "storage.modifier.enforcescript",
+      "match": "\\b(private|protected|static|override|const|ref|autoptr|out|inout|thread|proto|native)\\b"
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.enforcescript",
+          "match": "\\b(true|false|null|this|super)\\b"
+        }
+      ]
+    }
+  }
+}
