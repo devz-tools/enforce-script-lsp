@@ -106,9 +106,16 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
     for decl in &program.declarations {
         match decl {
             Declaration::Class(class) => {
-                index
-                    .class_parents
-                    .insert(class.name.clone(), class.extends.clone());
+                // A `modded class X` without `extends` must not overwrite the base
+                // `class X : Parent`'s parent (the modded class just adds members).
+                let is_modded = class.modifiers.iter().any(|m| m == "modded");
+                if is_modded && class.extends.is_none() {
+                    index.class_parents.entry(class.name.clone()).or_insert(None);
+                } else {
+                    index
+                        .class_parents
+                        .insert(class.name.clone(), class.extends.clone());
+                }
                 index.insert(
                     &uri,
                     Symbol {
