@@ -205,8 +205,7 @@ pub enum Statement {
     VariableDeclaration {
         modifiers: Vec<String>,
         type_ref: TypeRef,
-        name: String,
-        initializer: Option<Expression>,
+        declarators: Vec<(String, Option<Expression>)>,
         span: Span,
     },
     Expression {
@@ -1099,19 +1098,24 @@ impl Parser {
                 self.advance(); // ')'
             }
 
+            let mut declarators = Vec::new();
             let initializer = if self.match_token(&[TokenType::Assign]) {
                 Some(self.parse_expression()?)
             } else {
                 None
             };
+            declarators.push((name, initializer));
 
-            // Multi-variable declaration: `vector a, b, c;` — consume the extra
-            // names (each with an optional initializer).
+            // Multi-variable declaration: `vector a, b, c;` or `int i = 0, nr = N;`
+            // — collect each extra name with its optional initializer.
             while self.match_token(&[TokenType::Comma]) {
-                self.consume_identifier("Expected variable name")?;
-                if self.match_token(&[TokenType::Assign]) {
-                    self.parse_expression()?;
-                }
+                let extra_name = self.consume_identifier("Expected variable name")?;
+                let extra_init = if self.match_token(&[TokenType::Assign]) {
+                    Some(self.parse_expression()?)
+                } else {
+                    None
+                };
+                declarators.push((extra_name, extra_init));
             }
 
             self.consume_semicolon_or_asi();
@@ -1120,8 +1124,7 @@ impl Parser {
             return Ok(Statement::VariableDeclaration {
                 modifiers,
                 type_ref,
-                name,
-                initializer,
+                declarators,
                 span: Span::new(start, end),
             });
         }

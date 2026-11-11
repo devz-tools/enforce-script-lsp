@@ -474,27 +474,28 @@ impl SemanticAnalyzer {
             Statement::VariableDeclaration {
                 modifiers,
                 type_ref,
-                name,
-                initializer,
+                declarators,
                 span,
             } => {
-                let symbol = Symbol {
-                    name: name.clone(),
-                    kind: SymbolKind::Variable,
-                    type_ref: Some(type_ref.clone()),
-                    span: span.clone(),
-                    scope: self.symbol_table.current_scope,
-                    modifiers: modifiers.clone(),
-                    parent: self.symbol_table.current_class.clone(),
-                };
+                for (name, initializer) in declarators {
+                    let symbol = Symbol {
+                        name: name.clone(),
+                        kind: SymbolKind::Variable,
+                        type_ref: Some(type_ref.clone()),
+                        span: span.clone(),
+                        scope: self.symbol_table.current_scope,
+                        modifiers: modifiers.clone(),
+                        parent: self.symbol_table.current_class.clone(),
+                    };
 
-                if let Err(e) = self.symbol_table.define(symbol) {
-                    self.errors.push(e);
-                }
+                    if let Err(e) = self.symbol_table.define(symbol) {
+                        self.errors.push(e);
+                    }
 
-                if let Some(init) = initializer {
-                    self.analyze_expression(init)?;
-                    // TODO: Type check initializer against variable type
+                    if let Some(init) = initializer {
+                        self.analyze_expression(init)?;
+                        // TODO: Type check initializer against variable type
+                    }
                 }
             }
             Statement::Expression { expression, .. } => {
@@ -840,6 +841,37 @@ void Test()
         let _ = analyzer.analyze(&program);
 
         assert!(!analyzer.get_warnings().is_empty());
+    }
+
+    #[test]
+    fn test_multi_declarator_registers_all() {
+        // `int i = 0, nr = 5;` declares BOTH `i` and `nr` — the second name must
+        // also be registered (not dropped), so it is not reported "undefined".
+        let code = r#"
+void Test()
+{
+    int i = 0, nr = 5;
+    string bulletTypeName, ammoTypeName;
+    Print(i + nr + bulletTypeName + ammoTypeName);
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        let warnings = analyzer.get_warnings();
+        for name in ["nr", "ammoTypeName"] {
+            assert!(
+                !warnings.iter().any(|w| w.contains(&format!("Undefined identifier '{}'", name))),
+                "{} should be registered, got: {:?}",
+                name,
+                warnings
+            );
+        }
     }
 
     #[test]

@@ -102,35 +102,36 @@ fn lint_statement(
 ) {
     match stmt {
         Statement::VariableDeclaration {
-            name,
-            initializer,
+            declarators,
             span,
             ..
         } => {
-            // Enforce has no block scope — a variable name can only be declared
-            // once per function, even in different blocks / for-loop initializers.
-            if !declared.insert(name.clone()) {
-                issues.push(LintIssue {
-                    message: format!(
-                        "Variable '{}' declared more than once in the same method",
-                        name
-                    ),
-                    line: span.start.line,
-                    is_error: true,
-                });
-            }
-            if is_reserved_type_name(name) {
-                issues.push(LintIssue {
-                    message: format!(
-                        "Variable '{}' shadows a built-in class name (engine crash on startup)",
-                        name
-                    ),
-                    line: span.start.line,
-                    is_error: true,
-                });
-            }
-            if let Some(init) = initializer {
-                lint_expression(init, config, issues, None);
+            for (name, initializer) in declarators {
+                // Enforce has no block scope — a variable name can only be declared
+                // once per function, even in different blocks / for-loop initializers.
+                if !declared.insert(name.clone()) {
+                    issues.push(LintIssue {
+                        message: format!(
+                            "Variable '{}' declared more than once in the same method",
+                            name
+                        ),
+                        line: span.start.line,
+                        is_error: true,
+                    });
+                }
+                if is_reserved_type_name(name) {
+                    issues.push(LintIssue {
+                        message: format!(
+                            "Variable '{}' shadows a built-in class name (engine crash on startup)",
+                            name
+                        ),
+                        line: span.start.line,
+                        is_error: true,
+                    });
+                }
+                if let Some(init) = initializer {
+                    lint_expression(init, config, issues, None);
+                }
             }
         }
         Statement::Expression { expression, .. } => {
