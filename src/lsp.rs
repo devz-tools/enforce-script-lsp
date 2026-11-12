@@ -1102,26 +1102,40 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        // Build the cross-file symbol index from the workspace (blocking, but
-        // the project is small; optimize with spawn_blocking later if needed).
-        let indexed = {
-            let ws = self.workspace.read().unwrap();
-            match ws.as_ref() {
-                Some(ws) => {
-                    let index = SymbolIndex::build(ws);
-                    let n = index.by_name.len();
-                    *self.symbol_index.write().unwrap() = Some(Arc::new(index));
-                    Some(n)
-                }
-                None => None,
-            }
-        };
+        // Build the cross-file symbol index on a blocking thread so the server
+        // stays responsive during the (cold) ~40s vanilla-pack build.
+        let ws = self.workspace.clone();
+        let index = tokio::task::spawn_blocking(move || {
+            let ws = ws.read().unwrap();
+            ws.as_ref().map(SymbolIndex::build)
+        })
+        .await
+        .ok()
+        .flatten();
 
-        let msg = match indexed {
-            Some(n) => format!("Enforce Script LSP initialized ({} indexed symbols)", n),
-            None => "Enforce Script LSP initialized".to_string(),
+        let Some(index) = index else {
+            return;
         };
-        self.client.log_message(MessageType::INFO, msg).await;
+        let n = index.by_name.len();
+        *self.symbol_index.write().unwrap() = Some(Arc::new(index));
+
+        // Re-analyze documents opened while the index was building, so their
+        // diagnostics get cross-file resolution (they were analyzed without it).
+        let docs: Vec<(String, String)> = self
+            .documents
+            .iter()
+            .map(|d| (d.key().clone(), d.value().text.clone()))
+            .collect();
+        for (uri, text) in docs {
+            self.analyze_document(&uri, &text).await;
+        }
+
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Enforce Script LSP initialized ({} indexed symbols)", n),
+            )
+            .await;
     }
 
     async fn shutdown(&self) -> Result<()> {
