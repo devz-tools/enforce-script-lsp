@@ -122,12 +122,18 @@ cargo run --release
 
 ### 🚧 Partially Implemented
 
-- **Workspace Symbols** - Global symbol search (stub implemented)
-- **Go to Implementation** - Navigate to implementations (stub implemented)
-- **Go to Type Definition** - Navigate to type definitions (stub implemented)
-- **Code Actions** - Quick fixes and refactorings (stub implemented)
-- **Rename** - Symbol renaming (stub implemented)
-- **Inlay Hints** - Inline type/parameter hints (stub implemented)
+- **Member completion after `.`** — resolves `obj.`/`this.`/`super.` to the type's members
+  (including inherited ones), but does not yet resolve the return type of a method call
+  (`GetWeapon().`) or primitive members (`vector.Zero`).
+
+Stubs (registered but not implemented yet):
+
+- **Workspace Symbols** - Global symbol search
+- **Go to Implementation** - Navigate to implementations
+- **Go to Type Definition** - Navigate to type definitions
+- **Code Actions** - Quick fixes and refactorings
+- **Rename** - Symbol renaming
+- **Inlay Hints** - Inline type/parameter hints
 
 ## Building
 
@@ -286,9 +292,6 @@ The implementation follows the official Enforce Script syntax as documented in `
 
 ## Current limitations / roadmap
 
-- **Member completion after `.`** — resolves `obj.`/`this.`/`super.` to the type's members, but
-  does not yet resolve the return type of a method call (`GetWeapon().`) or primitive members
-  (`vector.Zero`).
 - **`modded class` merging** — the members of `modded class X` are indexed under `X` (so they
   resolve), but `class_parents` is not merged: a `modded class X` without `extends` overwrites
   the base `class X : Parent`, breaking the inheritance chain. Separately, `Symbol 'X' already
