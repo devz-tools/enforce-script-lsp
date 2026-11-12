@@ -3,6 +3,113 @@
 use crate::parser::*;
 use std::collections::{HashMap, HashSet};
 
+/// C++ engine constants/enums that are available in vanilla scripts without a
+/// script-side declaration. The analyzer flags these as "Undefined identifier"
+/// otherwise, producing false positives. (Do NOT add `#ifdef`-gated enums here;
+/// those are handled separately via `DEFAULT_DEFINES`.)
+const KNOWN_ENGINE_CONSTANTS: &[&str] = &[
+    "UAAction",
+    "UAAimDown",
+    "UAAimLeft",
+    "UAAimRight",
+    "UAAimUp",
+    "UACarShiftGearDown",
+    "UACarShiftGearUp",
+    "UAChat",
+    "UADefaultAction",
+    "UADropitem",
+    "UAGear",
+    "UAGetOver",
+    "UALeanLeft",
+    "UALeanRight",
+    "UALookAround",
+    "UAMapToggle",
+    "UAMoveBack",
+    "UAMoveForward",
+    "UAMoveLeft",
+    "UAMoveRight",
+    "UANextAction",
+    "UANextActionCategory",
+    "UAPersonView",
+    "UAPrevAction",
+    "UAPrevActionCategory",
+    "UAReloadMagazine",
+    "UASwitchPreset",
+    "UATempRaiseWeapon",
+    "UAThrowitem",
+    "UAToggleWeapons",
+    "UATurbo",
+    "UAUIBack",
+    "UAUICombine",
+    "UAUICopyDebugMonitorPos",
+    "UAUICredits",
+    "UAUICtrlX",
+    "UAUICtrlY",
+    "UAUIDown",
+    "UAUIGesturesOpen",
+    "UAUILeft",
+    "UAUIMenu",
+    "UAUINextDown",
+    "UAUINextUp",
+    "UAUIQuickbarRadialOpen",
+    "UAUIQuickbarToggle",
+    "UAUIRight",
+    "UAUIRotateInventory",
+    "UAUISelect",
+    "UAUITabLeft",
+    "UAUITabRight",
+    "UAUIThumbRight",
+    "UAUIUp",
+    "UAVoiceDistanceDown",
+    "UAVoiceDistanceUp",
+    "UAWalkRunForced",
+    "UAWalkRunTemp",
+    "UAZeroingDown",
+    "UAZeroingUp",
+    "UAZoomInOptics",
+    "UAZoomInOpticsControllerHelper",
+    "UAZoomOutOptics",
+    "UAZoomOutOpticsControllerHelper",
+    "DBB_CANCEL",
+    "DBB_NO",
+    "DBB_NONE",
+    "DBB_OK",
+    "DBB_YES",
+    "DBT_OK",
+    "DBT_YESNO",
+    "DBT_YESNOCANCEL",
+    "DMT_EXCLAMATION",
+    "DMT_INFO",
+    "DMT_QUESTION",
+    "CCAdmin",
+    "CCBattlEye",
+    "CCDirect",
+    "CCMegaphone",
+    "CCPublicAddressSystem",
+    "CCSystem",
+    "CCTransmitter",
+    "CT_ARRAY",
+    "CT_CLASS",
+    "DT_CUSTOM",
+    "EUAINPUT_DEVICE_CONTROLLER",
+    "EUAINPUT_DEVICE_KEYBOARD",
+    "EUAINPUT_DEVICE_KEYBOARDMOUSE",
+    "EUAINPUT_DEVICE_MOUSE",
+    "FLT_MAX",
+    "FLT_MIN",
+    "MB_PRESSED_MASK",
+    "OPTIONS_FIELD_OF_VIEW_MAX",
+    "OPTIONS_FIELD_OF_VIEW_MIN",
+    "ChatMaxSystemLength",
+    "ChatMaxUserLength",
+    "HIDE_INV_FROM_SCRIPT",
+    "LOCK_FROM_SCRIPT",
+    "FrameWidgetTypeID",
+    "WindowsResizeEventTypeID",
+    "LinebreakOverrideMode",
+    "VoiceEffectObstruction",
+];
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SymbolKind {
     Class,
@@ -630,7 +737,8 @@ impl SemanticAnalyzer {
                         .is_some_and(|c| self.global_env.has_member(c, name));
                     let lenient_known = self.lenient_member_scope
                         && self.global_env.all_members.contains(name);
-                    if !name.contains('.') && !known_global && !inherited && !lenient_known {
+                    let engine_known = KNOWN_ENGINE_CONSTANTS.contains(&name.as_str());
+                    if !name.contains('.') && !known_global && !inherited && !lenient_known && !engine_known {
                         self.warnings.push(format!(
                             "Undefined identifier '{}' at line {}",
                             name, span.start.line
@@ -790,6 +898,39 @@ class Child : Parent
             .warnings
             .iter()
             .any(|w| w.contains("m_field") || w.contains("MyEnum")));
+    }
+
+    #[test]
+    fn test_known_engine_constants_not_flagged() {
+        // Bare C++ engine constants (available without a script-side
+        // declaration) must not be reported as "undefined".
+        let code = r#"
+void Test()
+{
+    int a = DT_CUSTOM;
+    int b = UAChat;
+    int c = FLT_MAX;
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        let warnings = analyzer.get_warnings();
+        for name in ["DT_CUSTOM", "UAChat", "FLT_MAX"] {
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("Undefined identifier '{}'", name))),
+                "{} should be a known engine constant, got: {:?}",
+                name,
+                warnings
+            );
+        }
     }
 
     #[test]
