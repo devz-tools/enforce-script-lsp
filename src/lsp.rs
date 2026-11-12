@@ -93,11 +93,18 @@ impl Backend {
 
         let symbol_table = if let Some(ref prog) = program {
             let mut analyzer = SemanticAnalyzer::new();
-            // Resolve cross-file identifiers (globals, inherited members).
-            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
-                analyzer.set_global_environment(index.environment());
-            }
+            // Resolve cross-file identifiers (globals, inherited members). While
+            // the index is still building, suppress "undefined identifier"
+            // warnings — cross-file symbols would otherwise read as undefined.
+            let index_ready = {
+                let index = self.symbol_index.read().unwrap();
+                if let Some(index) = index.as_ref() {
+                    analyzer.set_global_environment(index.environment());
+                }
+                index.is_some()
+            };
             analyzer.set_lenient_member_scope(self.lenient_member_scope.load(Ordering::Relaxed));
+            analyzer.set_suppress_undefined(!index_ready);
             match analyzer.analyze(prog) {
                 Ok(_) => {
                     // Add warnings as diagnostics

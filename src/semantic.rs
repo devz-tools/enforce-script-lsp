@@ -253,6 +253,9 @@ pub struct SemanticAnalyzer {
     /// Lenient member scoping: treat a bare name as defined if it's a member of
     /// *any* class (default false — strict namespace model).
     lenient_member_scope: bool,
+    /// Suppress "Undefined identifier" warnings (used while the cross-file
+    /// index is still building — cross-file symbols would read as undefined).
+    suppress_undefined: bool,
 }
 
 /// Cross-file symbol environment: globals, class hierarchy and members, used to
@@ -298,6 +301,7 @@ impl SemanticAnalyzer {
             class_hierarchy: HashMap::new(),
             global_env: GlobalEnvironment::default(),
             lenient_member_scope: false,
+            suppress_undefined: false,
         }
     }
 
@@ -307,6 +311,10 @@ impl SemanticAnalyzer {
 
     pub fn set_lenient_member_scope(&mut self, lenient: bool) {
         self.lenient_member_scope = lenient;
+    }
+
+    pub fn set_suppress_undefined(&mut self, suppress: bool) {
+        self.suppress_undefined = suppress;
     }
 
     pub fn analyze(&mut self, program: &Program) -> Result<(), Vec<String>> {
@@ -738,7 +746,13 @@ impl SemanticAnalyzer {
                     let lenient_known = self.lenient_member_scope
                         && self.global_env.all_members.contains(name);
                     let engine_known = KNOWN_ENGINE_CONSTANTS.contains(&name.as_str());
-                    if !name.contains('.') && !known_global && !inherited && !lenient_known && !engine_known {
+                    if !self.suppress_undefined
+                        && !name.contains('.')
+                        && !known_global
+                        && !inherited
+                        && !lenient_known
+                        && !engine_known
+                    {
                         self.warnings.push(format!(
                             "Undefined identifier '{}' at line {}",
                             name, span.start.line
