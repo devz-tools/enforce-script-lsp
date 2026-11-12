@@ -15,6 +15,10 @@ async function activate(context) {
     // initializationOptions.dependencyRoots.
     const dependencyRoots = config.get('dependencyRoots') || [];
 
+    // Default preprocessor defines (engine feature flags) passed to the server
+    // as initializationOptions.defaultDefines.
+    const defaultDefines = config.get('defaultDefines') || [];
+
     client = new LanguageClient(
         'enforceScriptLspLocal',
         'Enforce Script LSP (Local)',
@@ -22,7 +26,7 @@ async function activate(context) {
           debug: { command: serverPath, transport: TransportKind.stdio } },
         { documentSelector: [{ scheme: 'file', language: 'enforcescript' }],
           outputChannelName: 'Enforce Script LSP (Local)',
-          initializationOptions: { dependencyRoots } }
+          initializationOptions: { dependencyRoots, defaultDefines } }
     );
     context.subscriptions.push(client);
     await client.start();

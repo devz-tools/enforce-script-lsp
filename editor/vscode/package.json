@@ -46,6 +46,14 @@
           },
           "default": [],
           "description": "Additional source roots to index (vanilla / Expansion script directories)."
+        },
+        "enforceScriptLsp.defaultDefines": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Default preprocessor defines applied to every file (engine feature flags, e.g. FEATURE_NETWORK_RECONCILIATION)."
         }
       }
     }
