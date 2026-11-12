@@ -144,7 +144,14 @@ impl Backend {
                     let is_config =
                         path.file_name().and_then(|n| n.to_str()) == Some("config.cpp");
                     let is_script = path.extension().and_then(|e| e.to_str()) == Some("c");
-                    if is_script && !is_config && !ws.is_compiled(&path) {
+                    // Only flag the project's own files: dependency roots
+                    // (vanilla/Expansion) have no config.cpp in our workspace, so
+                    // every one of their files would otherwise be flagged.
+                    let in_dependency = ws
+                        .dependency_roots
+                        .iter()
+                        .any(|d| path.starts_with(d));
+                    if is_script && !is_config && !ws.is_compiled(&path) && !in_dependency {
                         diagnostics.push(create_diagnostic(
                             "File is not included in any module's files[] — excluded from compilation"
                                 .to_string(),
