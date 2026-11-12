@@ -643,6 +643,21 @@ fn extract_lenient_member_scope(opts: &Option<serde_json::Value>) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract `defaultDefines` (preprocessor defines applied to every file) from
+/// initialization options (default empty).
+fn extract_default_defines(opts: &Option<serde_json::Value>) -> Vec<String> {
+    opts.as_ref()
+        .and_then(|v| v.get("defaultDefines"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Extract line number from error message (format: "... at line N")
 fn extract_line_from_error(message: &str) -> Option<usize> {
     if let Some(idx) = message.rfind("at line ") {
@@ -1012,7 +1027,8 @@ impl LanguageServer for Backend {
         if let Some(uri) = params.root_uri {
             if let Ok(root) = uri.to_file_path() {
                 let dependency_roots = extract_dependency_roots(&params.initialization_options);
-                let workspace = Workspace::build(&root, dependency_roots);
+                let default_defines = extract_default_defines(&params.initialization_options);
+                let workspace = Workspace::build(&root, dependency_roots, default_defines);
                 *self.workspace.write().unwrap() = Some(workspace);
             }
         }

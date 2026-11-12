@@ -89,12 +89,20 @@ pub struct Workspace {
     pub prefix_map: HashMap<String, PathBuf>,
     /// Absolute paths of every compiled directory (module layer).
     pub compiled_dirs: HashSet<PathBuf>,
+    /// Default preprocessor defines applied to every file (e.g. engine feature
+    /// flags like `FEATURE_NETWORK_RECONCILIATION`), configured via
+    /// `defaultDefines` in initializationOptions. Merged into `defines_for`.
+    pub default_defines: HashSet<String>,
 }
 
 impl Workspace {
     /// Discover every `config.cpp` under `root` and build the workspace model.
     /// `dependency_roots` are extra roots (vanilla/Expansion) indexed separately.
-    pub fn build(root: &Path, dependency_roots: Vec<PathBuf>) -> Workspace {
+    pub fn build(
+        root: &Path,
+        dependency_roots: Vec<PathBuf>,
+        default_defines: Vec<String>,
+    ) -> Workspace {
         let mut configs = Vec::new();
         for path in discover_config_files(root) {
             if let Ok(text) = std::fs::read_to_string(&path) {
@@ -141,6 +149,7 @@ impl Workspace {
             configs,
             prefix_map,
             compiled_dirs,
+            default_defines: default_defines.into_iter().collect(),
         }
     }
 
@@ -154,15 +163,17 @@ impl Workspace {
     /// Active `defines[]` for the module that owns `path`, found by walking up
     /// from the file to the nearest `config.cpp`.
     pub fn defines_for(&self, path: &Path) -> HashSet<String> {
+        let mut defines = self.default_defines.clone();
         let mut dir = path.parent();
         while let Some(d) = dir {
             let config = d.join("config.cpp");
             if let Some(cfg) = self.configs.iter().find(|c| c.path == config) {
-                return cfg.defines.iter().cloned().collect();
+                defines.extend(cfg.defines.iter().cloned());
+                return defines;
             }
             dir = d.parent();
         }
-        HashSet::new()
+        defines
     }
 }
 
@@ -278,11 +289,27 @@ class CfgMods
         )
         .unwrap();
 
-        let ws = Workspace::build(&root, Vec::new());
+        let ws = Workspace::build(&root, Vec::new(), Vec::new());
         assert_eq!(ws.configs.len(), 1);
         assert!(ws.is_compiled(&root.join("src/cons/3_Game/foo.c")));
         assert!(ws.is_compiled(&root.join("src/cons/4_World/bar.c")));
         assert!(!ws.is_compiled(&root.join("src/cons/unlisted.c")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_defines_for_applies_default_defines_to_vanilla_path() {
+        let root = std::env::temp_dir().join("enf_lsp_ws_defines_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let ws = Workspace::build(&root, Vec::new(), vec!["FEATURE_X".to_string()]);
+
+        // A path with no config.cpp anywhere up the tree must still see the
+        // default defines (vanilla/engine files have no config.cpp).
+        let defines = ws.defines_for(Path::new("/nonexistent/vanilla/foo.c"));
+        assert!(defines.contains("FEATURE_X"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
