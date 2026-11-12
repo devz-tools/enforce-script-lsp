@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::lexer::Lexer;
-use crate::parser::{Declaration, Expression, Parser, Program, Span, Statement, TypeRef};
+use crate::parser::{
+    type_ref_base_name, Declaration, Expression, Parser, Program, Span, Statement, TypeRef,
+};
 use crate::semantic::{GlobalEnvironment, Symbol, SymbolKind};
 use crate::workspace::Workspace;
 
@@ -40,6 +42,10 @@ pub struct IndexedUsage {
     /// Start line of the enclosing method/function (None at module level) —
     /// used later to disambiguate same-named locals across methods.
     pub enclosing_method_line: Option<usize>,
+    /// The object identifier of a `MemberMember` usage (`obj` in `obj.member`),
+    /// so the member's declaring class can be resolved from the object's type.
+    /// `None` for other roles and when the object is not a plain identifier.
+    pub object_name: Option<String>,
 }
 
 /// Cross-file symbol index: name → occurrences across the whole project.
@@ -52,6 +58,19 @@ pub struct SymbolIndex {
     /// Populated during `index_file` alongside `by_name`.
     #[allow(dead_code)] // Read by scope-aware find-references (next step).
     pub by_usage: HashMap<String, Vec<IndexedUsage>>,
+    /// Canonical scope-aware identity → occurrences `(uri, span)`. Identity is
+    /// `g:<name>` (global), `m:<class>:<name>` (member) or
+    /// `l:<uri>:<method_line>:<name>` (local). Populated during `index_file`.
+    #[allow(dead_code)] // Read by scope-aware find-references (next step).
+    pub by_identity: HashMap<String, Vec<(String, Span)>>,
+    /// Per-file local variable/parameter types (uri → name → base type name),
+    /// used to resolve a `MemberMember` object's type during the second pass.
+    by_local_types: HashMap<String, HashMap<String, String>>,
+}
+
+/// Primitive types are not indexed as `g:` identities.
+fn is_primitive_type(name: &str) -> bool {
+    matches!(name, "int" | "float" | "bool" | "string" | "vector" | "void")
 }
 
 impl SymbolIndex {
@@ -65,6 +84,8 @@ impl SymbolIndex {
         for root in &workspace.dependency_roots {
             index_dir(root, workspace, &mut index);
         }
+        // Second pass: resolve usage identities now that the whole index exists.
+        index.resolve_identities();
         index
     }
 
@@ -105,6 +126,176 @@ impl SymbolIndex {
         env.class_parents = self.class_parents.clone();
         env
     }
+
+    /// Compute the canonical identity for one usage, using the index plus the
+    /// file's local variable/parameter types.
+    pub fn resolve_usage_identity(
+        &self,
+        usage: &IndexedUsage,
+        local_types: &HashMap<String, String>,
+    ) -> Option<String> {
+        match usage.role {
+            UsageRole::Type => {
+                if is_primitive_type(&usage.name) {
+                    None
+                } else {
+                    Some(format!("g:{}", usage.name))
+                }
+            }
+            UsageRole::Bare | UsageRole::MemberObject => self.resolve_bare_identity(usage),
+            UsageRole::MemberMember => self.resolve_member_identity(usage, local_types),
+        }
+    }
+
+    /// Bare / object identifier: member of enclosing class → global → local.
+    fn resolve_bare_identity(&self, usage: &IndexedUsage) -> Option<String> {
+        if let Some(class) = &usage.enclosing_class {
+            if let Some(declaring) = self.find_declaring_class(class, &usage.name) {
+                return Some(format!("m:{}:{}", declaring, usage.name));
+            }
+        }
+        if self.is_global(&usage.name) {
+            return Some(format!("g:{}", usage.name));
+        }
+        Some(format!(
+            "l:{}:{}:{}",
+            usage.uri,
+            usage.enclosing_method_line.unwrap_or(0),
+            usage.name
+        ))
+    }
+
+    /// Member access: resolve the object's type, then find the member's
+    /// declaring class in that type's ancestry.
+    fn resolve_member_identity(
+        &self,
+        usage: &IndexedUsage,
+        local_types: &HashMap<String, String>,
+    ) -> Option<String> {
+        let object = usage.object_name.as_deref()?;
+        let object_type = self.resolve_object_type(object, usage, local_types)?;
+        let declaring = self.find_declaring_class(&object_type, &usage.name)?;
+        Some(format!("m:{}:{}", declaring, usage.name))
+    }
+
+    /// Resolve the type of a member-access object: a class/enum name, a local
+    /// variable/parameter type, or a field of the enclosing class/ancestors.
+    fn resolve_object_type(
+        &self,
+        object: &str,
+        usage: &IndexedUsage,
+        local_types: &HashMap<String, String>,
+    ) -> Option<String> {
+        if self.is_type_name(object) {
+            return Some(object.to_string());
+        }
+        if let Some(t) = local_types.get(object) {
+            return Some(t.clone());
+        }
+        if let Some(class) = &usage.enclosing_class {
+            if let Some(t) = self.find_field_type(class, object) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// Whether `name` is a class or enum (a static access target).
+    fn is_type_name(&self, name: &str) -> bool {
+        if self.class_parents.contains_key(name) {
+            return true;
+        }
+        if let Some(occs) = self.by_name.get(name) {
+            return occs
+                .iter()
+                .any(|o| matches!(o.symbol.kind, SymbolKind::Class | SymbolKind::Enum));
+        }
+        false
+    }
+
+    /// Whether `name` is a global (class/enum/function/global variable).
+    fn is_global(&self, name: &str) -> bool {
+        if let Some(occs) = self.by_name.get(name) {
+            return occs.iter().any(|o| {
+                o.symbol.parent.is_none()
+                    && matches!(
+                        o.symbol.kind,
+                        SymbolKind::Class
+                            | SymbolKind::Enum
+                            | SymbolKind::Function
+                            | SymbolKind::Variable
+                    )
+            });
+        }
+        false
+    }
+
+    /// Find the nearest ancestor of `class` that declares a member `name`
+    /// (field, method, or enum variant); return that declaring class/enum.
+    fn find_declaring_class(&self, class: &str, name: &str) -> Option<String> {
+        let mut current = Some(class.to_string());
+        let mut guard = 0;
+        while let Some(c) = current {
+            if self.class_has_member(&c, name) {
+                return Some(c);
+            }
+            current = self.class_parents.get(&c).cloned().flatten();
+            guard += 1;
+            if guard > 100 {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Whether `class` (or enum) declares a member `name` directly.
+    fn class_has_member(&self, class: &str, name: &str) -> bool {
+        if let Some(occs) = self.by_name.get(name) {
+            for occ in occs {
+                if occ.symbol.parent.as_deref() == Some(class)
+                    && matches!(occ.symbol.kind, SymbolKind::Field | SymbolKind::Method)
+                {
+                    return true;
+                }
+            }
+        }
+        // Enum variant: indexed as `Enum.Variant` with parent == Enum.
+        if let Some(occs) = self.by_name.get(&format!("{}.{}", class, name)) {
+            for occ in occs {
+                if occ.symbol.parent.as_deref() == Some(class)
+                    && occ.symbol.kind == SymbolKind::EnumVariant
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Find the type of a field `name` declared in `class` or its ancestors.
+    fn find_field_type(&self, class: &str, name: &str) -> Option<String> {
+        let mut current = Some(class.to_string());
+        let mut guard = 0;
+        while let Some(c) = current {
+            if let Some(occs) = self.by_name.get(name) {
+                for occ in occs {
+                    if occ.symbol.parent.as_deref() == Some(c.as_str())
+                        && matches!(occ.symbol.kind, SymbolKind::Field | SymbolKind::Variable)
+                    {
+                        if let Some(t) = &occ.symbol.type_ref {
+                            return Some(type_ref_base_name(t));
+                        }
+                    }
+                }
+            }
+            current = self.class_parents.get(&c).cloned().flatten();
+            guard += 1;
+            if guard > 100 {
+                break;
+            }
+        }
+        None
+    }
 }
 
 fn index_dir(dir: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
@@ -139,6 +330,13 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
     };
 
     let uri = format!("file://{}", path.display());
+    index_program(&program, &uri, index);
+}
+
+/// Index one parsed file: register definitions (`by_name`, `class_parents`),
+/// collect identifier usages (`by_usage`), and resolve each usage's canonical
+/// scope-aware identity (`by_identity`).
+fn index_program(program: &Program, uri: &str, index: &mut SymbolIndex) {
     for decl in &program.declarations {
         match decl {
             Declaration::Class(class) => {
@@ -153,7 +351,7 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
                         .insert(class.name.clone(), class.extends.clone());
                 }
                 index.insert(
-                    &uri,
+                    uri,
                     Symbol {
                         name: class.name.clone(),
                         kind: SymbolKind::Class,
@@ -166,7 +364,7 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
                 );
                 for field in &class.fields {
                     index.insert(
-                        &uri,
+                        uri,
                         Symbol {
                             name: field.name.clone(),
                             kind: SymbolKind::Field,
@@ -180,7 +378,7 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
                 }
                 for method in &class.methods {
                     index.insert(
-                        &uri,
+                        uri,
                         Symbol {
                             name: method.name.clone(),
                             kind: SymbolKind::Method,
@@ -195,7 +393,7 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
             }
             Declaration::Enum(enum_decl) => {
                 index.insert(
-                    &uri,
+                    uri,
                     Symbol {
                         name: enum_decl.name.clone(),
                         kind: SymbolKind::Enum,
@@ -208,7 +406,7 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
                 );
                 for variant in &enum_decl.variants {
                     index.insert(
-                        &uri,
+                        uri,
                         Symbol {
                             name: format!("{}.{}", enum_decl.name, variant.name),
                             kind: SymbolKind::EnumVariant,
@@ -222,7 +420,7 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
                     // DayZ also exposes each variant as a C++-style global
                     // `EnumNameVariantName` (e.g. ObjIntersectView = ObjIntersect.View).
                     index.insert(
-                        &uri,
+                        uri,
                         Symbol {
                             name: format!("{}{}", enum_decl.name, variant.name),
                             kind: SymbolKind::EnumVariant,
@@ -247,7 +445,7 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
                         .or_insert(Some(target.clone()));
                 }
                 index.insert(
-                    &uri,
+                    uri,
                     Symbol {
                         name: typedef.name.clone(),
                         kind: SymbolKind::Class, // typedef acts as an alias
@@ -261,7 +459,7 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
             }
             Declaration::Function(method) => {
                 index.insert(
-                    &uri,
+                    uri,
                     Symbol {
                         name: method.name.clone(),
                         kind: SymbolKind::Function,
@@ -275,7 +473,7 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
             }
             Declaration::Variable(field) => {
                 index.insert(
-                    &uri,
+                    uri,
                     Symbol {
                         name: field.name.clone(),
                         kind: SymbolKind::Variable,
@@ -290,24 +488,54 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
         }
     }
 
-    // Collect identifier usages (references) alongside the definitions above.
+    // Collect identifier usages (references) and local variable/parameter types
+    // alongside the definitions above. Identity resolution is deferred to a
+    // second pass (after the whole project is indexed), so cross-file member
+    // references resolve regardless of index order.
     let mut usages = Vec::new();
-    collect_usages(&program, None, None, &mut usages);
-    for mut usage in usages {
-        usage.uri = uri.clone();
-        index
-            .by_usage
-            .entry(usage.name.clone())
-            .or_default()
-            .push(usage);
+    let mut local_types = HashMap::new();
+    collect_usages(program, None, None, &mut local_types, &mut usages);
+
+    index.by_local_types.insert(uri.to_string(), local_types);
+    for usage in usages {
+        let mut u = usage;
+        u.uri = uri.to_string();
+        index.by_usage.entry(u.name.clone()).or_default().push(u);
     }
 }
 
-/// Walk the AST and collect every identifier usage (references) with context.
+impl SymbolIndex {
+    /// Second pass: resolve every usage's identity now that the full index is
+    /// built, and populate `by_identity`. Must run after all files are indexed.
+    pub fn resolve_identities(&mut self) {
+        let mut by_identity: HashMap<String, Vec<(String, Span)>> = HashMap::new();
+        for usages in self.by_usage.values() {
+            for usage in usages {
+                let local_types = self
+                    .by_local_types
+                    .get(&usage.uri)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(identity) = self.resolve_usage_identity(usage, &local_types) {
+                    by_identity
+                        .entry(identity)
+                        .or_default()
+                        .push((usage.uri.clone(), usage.span.clone()));
+                }
+            }
+        }
+        self.by_identity = by_identity;
+    }
+}
+
+/// Walk the AST and collect every identifier usage (references) with context,
+/// plus the type of each local variable/parameter (name → base type name) for
+/// later member-type resolution.
 fn collect_usages(
     program: &Program,
     enclosing_class: Option<&str>,
     enclosing_method_line: Option<usize>,
+    local_types: &mut HashMap<String, String>,
     out: &mut Vec<IndexedUsage>,
 ) {
     for decl in &program.declarations {
@@ -341,12 +569,16 @@ fn collect_usages(
                     );
                     for param in &method.parameters {
                         collect_type_usages(&param.type_ref, &param.span, class_name, method_line, out);
+                        local_types.insert(
+                            param.name.clone(),
+                            type_ref_base_name(&param.type_ref),
+                        );
                         if let Some(default) = &param.default_value {
                             collect_expr_usages(default, class_name, method_line, out);
                         }
                     }
                     if let Some(body) = &method.body {
-                        collect_stmt_usages(body, class_name, method_line, out);
+                        collect_stmt_usages(body, class_name, method_line, local_types, out);
                     }
                 }
             }
@@ -378,12 +610,16 @@ fn collect_usages(
                 collect_type_usages(&method.return_type, &method.span, None, method_line, out);
                 for param in &method.parameters {
                     collect_type_usages(&param.type_ref, &param.span, None, method_line, out);
+                    local_types.insert(
+                        param.name.clone(),
+                        type_ref_base_name(&param.type_ref),
+                    );
                     if let Some(default) = &param.default_value {
                         collect_expr_usages(default, None, method_line, out);
                     }
                 }
                 if let Some(body) = &method.body {
-                    collect_stmt_usages(body, None, method_line, out);
+                    collect_stmt_usages(body, None, method_line, local_types, out);
                 }
             }
             Declaration::Variable(field) => {
@@ -417,6 +653,26 @@ fn push_usage(
         role,
         enclosing_class: enclosing_class.map(|s| s.to_string()),
         enclosing_method_line,
+        object_name: None,
+    });
+}
+
+fn push_member_usage(
+    out: &mut Vec<IndexedUsage>,
+    member: &str,
+    object_name: Option<&str>,
+    span: Span,
+    enclosing_class: Option<&str>,
+    enclosing_method_line: Option<usize>,
+) {
+    out.push(IndexedUsage {
+        name: member.to_string(),
+        uri: String::new(),
+        span,
+        role: UsageRole::MemberMember,
+        enclosing_class: enclosing_class.map(|s| s.to_string()),
+        enclosing_method_line,
+        object_name: object_name.map(|s| s.to_string()),
     });
 }
 
@@ -462,12 +718,15 @@ fn collect_stmt_usages(
     stmt: &Statement,
     enclosing_class: Option<&str>,
     enclosing_method_line: Option<usize>,
+    local_types: &mut HashMap<String, String>,
     out: &mut Vec<IndexedUsage>,
 ) {
     match stmt {
         Statement::VariableDeclaration { type_ref, declarators, span, .. } => {
             collect_type_usages(type_ref, span, enclosing_class, enclosing_method_line, out);
-            for (_, init) in declarators {
+            let base = type_ref_base_name(type_ref);
+            for (name, init) in declarators {
+                local_types.insert(name.clone(), base.clone());
                 if let Some(e) = init {
                     collect_expr_usages(e, enclosing_class, enclosing_method_line, out);
                 }
@@ -478,14 +737,14 @@ fn collect_stmt_usages(
         }
         Statement::Block { statements, .. } => {
             for s in statements {
-                collect_stmt_usages(s, enclosing_class, enclosing_method_line, out);
+                collect_stmt_usages(s, enclosing_class, enclosing_method_line, local_types, out);
             }
         }
         Statement::If { condition, then_branch, else_branch, .. } => {
             collect_expr_usages(condition, enclosing_class, enclosing_method_line, out);
-            collect_stmt_usages(then_branch, enclosing_class, enclosing_method_line, out);
+            collect_stmt_usages(then_branch, enclosing_class, enclosing_method_line, local_types, out);
             if let Some(e) = else_branch {
-                collect_stmt_usages(e, enclosing_class, enclosing_method_line, out);
+                collect_stmt_usages(e, enclosing_class, enclosing_method_line, local_types, out);
             }
         }
         Statement::Switch { expression, cases, .. } => {
@@ -495,13 +754,13 @@ fn collect_stmt_usages(
                     collect_expr_usages(e, enclosing_class, enclosing_method_line, out);
                 }
                 for s in statements {
-                    collect_stmt_usages(s, enclosing_class, enclosing_method_line, out);
+                    collect_stmt_usages(s, enclosing_class, enclosing_method_line, local_types, out);
                 }
             }
         }
         Statement::For { initializer, condition, increment, body, .. } => {
             if let Some(init) = initializer {
-                collect_stmt_usages(init, enclosing_class, enclosing_method_line, out);
+                collect_stmt_usages(init, enclosing_class, enclosing_method_line, local_types, out);
             }
             if let Some(c) = condition {
                 collect_expr_usages(c, enclosing_class, enclosing_method_line, out);
@@ -509,7 +768,7 @@ fn collect_stmt_usages(
             if let Some(inc) = increment {
                 collect_expr_usages(inc, enclosing_class, enclosing_method_line, out);
             }
-            collect_stmt_usages(body, enclosing_class, enclosing_method_line, out);
+            collect_stmt_usages(body, enclosing_class, enclosing_method_line, local_types, out);
         }
         Statement::Foreach { key_var, value_var, iterable, body, span, .. } => {
             if let Some((type_ref, _)) = key_var {
@@ -517,11 +776,11 @@ fn collect_stmt_usages(
             }
             collect_type_usages(&value_var.0, span, enclosing_class, enclosing_method_line, out);
             collect_expr_usages(iterable, enclosing_class, enclosing_method_line, out);
-            collect_stmt_usages(body, enclosing_class, enclosing_method_line, out);
+            collect_stmt_usages(body, enclosing_class, enclosing_method_line, local_types, out);
         }
         Statement::While { condition, body, .. } => {
             collect_expr_usages(condition, enclosing_class, enclosing_method_line, out);
-            collect_stmt_usages(body, enclosing_class, enclosing_method_line, out);
+            collect_stmt_usages(body, enclosing_class, enclosing_method_line, local_types, out);
         }
         Statement::Return { value, .. } => {
             if let Some(v) = value {
@@ -555,6 +814,7 @@ fn collect_expr_usages(
         Expression::MemberAccess { object, member, span } => {
             // The object is a reference (MemberObject) when it is a plain
             // identifier; otherwise recurse (e.g. `a.b.c` → `a` is the object).
+            let mut object_name = None;
             if let Expression::Identifier(name, object_span) = &**object {
                 push_usage(
                     out,
@@ -564,16 +824,17 @@ fn collect_expr_usages(
                     enclosing_class,
                     enclosing_method_line,
                 );
+                object_name = Some(name.as_str());
             } else {
                 collect_expr_usages(object, enclosing_class, enclosing_method_line, out);
             }
             // The member is a reference (MemberMember). The exact member span is
             // not tracked by the parser yet, so fall back to the whole
             // member-access span; refine later via `find_name_position`.
-            push_usage(
+            push_member_usage(
                 out,
                 member,
-                UsageRole::MemberMember,
+                object_name,
                 span.clone(),
                 enclosing_class,
                 enclosing_method_line,
@@ -710,6 +971,7 @@ mod collect_usages_tests {
     use super::{collect_usages, UsageRole};
     use crate::lexer::Lexer;
     use crate::parser::{Parser, Program};
+    use std::collections::HashMap;
 
     fn parse(code: &str) -> Program {
         let mut lexer = Lexer::new(code);
@@ -733,7 +995,7 @@ class Foo
 "#;
         let program = parse(code);
         let mut usages = Vec::new();
-        collect_usages(&program, None, None, &mut usages);
+        collect_usages(&program, None, None, &mut HashMap::new(), &mut usages);
 
         // Field type, with enclosing class context.
         let field = usages
@@ -765,9 +1027,119 @@ enum MyEnum : BaseEnum
 "#;
         let program = parse(code);
         let mut usages = Vec::new();
-        collect_usages(&program, None, None, &mut usages);
+        collect_usages(&program, None, None, &mut HashMap::new(), &mut usages);
 
         assert!(usages.iter().any(|u| u.name == "BaseEnum" && u.role == UsageRole::Type));
         assert!(!usages.iter().any(|u| u.name == "Alfa" || u.name == "Beta"));
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{index_program, IndexedUsage, SymbolIndex, UsageRole};
+    use crate::lexer::Lexer;
+    use crate::parser::{Parser, Position, Span};
+    use std::collections::HashMap;
+
+    fn index_snippet(code: &str) -> SymbolIndex {
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().expect("snippet should parse");
+        let mut index = SymbolIndex::default();
+        index_program(&program, "file:///test.c", &mut index);
+        index.resolve_identities();
+        index
+    }
+
+    #[test]
+    fn resolves_bare_member_local_type_and_member_member() {
+        let code = r#"
+class MyClass
+{
+    void DoSomething();
+}
+
+class Foo
+{
+    int m_value;
+    void MethodA()
+    {
+        MyClass obj;
+        obj.DoSomething();
+        int x;
+        x = m_value;
+    }
+    void MethodB()
+    {
+        int x;
+        x = 1;
+    }
+}
+
+class Bar
+{
+    int m_value;
+    void MethodC()
+    {
+        int y = m_value;
+    }
+}
+"#;
+        let index = index_snippet(code);
+
+        // A bare member inside the class resolves to its declaring class.
+        assert!(index.by_identity.contains_key("m:Foo:m_value"));
+        assert!(index.by_identity.contains_key("m:Bar:m_value"));
+
+        // A type usage resolves to a global identity.
+        assert!(index.by_identity.contains_key("g:MyClass"));
+
+        // Member access through a local variable resolves via its type.
+        assert!(index.by_identity.contains_key("m:MyClass:DoSomething"));
+
+        // The local `x` in two different methods gets two distinct identities.
+        let local_x: Vec<&String> = index
+            .by_identity
+            .keys()
+            .filter(|k| k.starts_with("l:") && k.ends_with(":x"))
+            .collect();
+        assert_eq!(local_x.len(), 2, "expected two distinct local x identities");
+
+        // Primitives are not indexed as globals.
+        assert!(!index.by_identity.contains_key("g:int"));
+        assert!(!index.by_identity.contains_key("g:void"));
+    }
+
+    #[test]
+    fn member_member_without_identifier_object_resolves_none() {
+        let index = SymbolIndex::default();
+        let local_types: HashMap<String, String> = HashMap::new();
+        let usage = IndexedUsage {
+            name: "Member".to_string(),
+            uri: "file:///test.c".to_string(),
+            span: Span::new(Position::new(1, 0, 0), Position::new(1, 6, 6)),
+            role: UsageRole::MemberMember,
+            enclosing_class: Some("Foo".to_string()),
+            enclosing_method_line: Some(1),
+            object_name: None,
+        };
+        assert_eq!(index.resolve_usage_identity(&usage, &local_types), None);
+    }
+
+    #[test]
+    fn primitive_type_usage_resolves_none() {
+        let index = SymbolIndex::default();
+        let local_types: HashMap<String, String> = HashMap::new();
+        let usage = IndexedUsage {
+            name: "int".to_string(),
+            uri: "file:///test.c".to_string(),
+            span: Span::new(Position::new(1, 0, 0), Position::new(1, 3, 3)),
+            role: UsageRole::Type,
+            enclosing_class: None,
+            enclosing_method_line: None,
+            object_name: None,
+        };
+        assert_eq!(index.resolve_usage_identity(&usage, &local_types), None);
     }
 }

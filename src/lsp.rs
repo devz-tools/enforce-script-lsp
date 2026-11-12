@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -9,7 +9,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::lexer::Lexer;
-use crate::index::{IndexedSymbol, SymbolIndex};
+use crate::index::{IndexedSymbol, IndexedUsage, SymbolIndex, UsageRole};
 use crate::lint::{lint, LintConfig, LintIssue};
 use crate::parser::{type_ref_base_name, Class, Declaration, Parser, Program, Span};
 use crate::semantic::{SemanticAnalyzer, Symbol, SymbolKind, SymbolTable};
@@ -1377,32 +1377,78 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         let uri_str = uri.to_string();
 
-        if let Some(doc) = self.documents.get(&uri_str) {
-            // Find symbol name at position
-            if let Some(symbol_name) = find_symbol_at_position(&doc.text, position) {
-                // For now, just return all symbols with the same name
-                // A more sophisticated implementation would track actual usage
-                if let Some(ref symbol_table) = doc.symbol_table {
-                    let mut locations = Vec::new();
+        let Some(doc) = self.documents.get(&uri_str) else {
+            return Ok(None);
+        };
+        let Some(symbol_name) = find_symbol_at_position(&doc.text, position) else {
+            return Ok(None);
+        };
 
-                    // Get all symbols with this name
-                    for symbol in symbol_table.get_all_symbols() {
-                        if symbol.name == symbol_name {
-                            locations.push(Location {
-                                uri: uri.clone(),
-                                range: span_to_range(&symbol.span),
-                            });
-                        }
-                    }
+        // Role: cursor on the member after `.` → MemberMember; otherwise bare.
+        let (role, object_name) = match find_member_context(&doc.text, position) {
+            Some((object, _)) if object != symbol_name => {
+                (UsageRole::MemberMember, Some(object))
+            }
+            _ => (UsageRole::Bare, None),
+        };
 
-                    if !locations.is_empty() {
-                        return Ok(Some(locations));
-                    }
+        // Local variable/parameter types (for member-access object resolution).
+        let mut local_types: HashMap<String, String> = HashMap::new();
+        if let Some(st) = doc.symbol_table.as_ref() {
+            for s in st.get_all_symbols() {
+                if matches!(s.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                    && let Some(t) = &s.type_ref
+                {
+                    local_types.insert(s.name.clone(), type_ref_base_name(t));
                 }
             }
         }
 
-        Ok(None)
+        let enclosing_class = doc
+            .program
+            .as_ref()
+            .and_then(|p| enclosing_class(p, position));
+        let enclosing_method_line = doc
+            .program
+            .as_ref()
+            .and_then(|p| enclosing_method(p, position))
+            .map(|s| s.start.line);
+
+        let usage = IndexedUsage {
+            name: symbol_name.clone(),
+            uri: uri_str.clone(),
+            span: Span::new(
+                crate::parser::Position::new(0, 0, 0),
+                crate::parser::Position::new(0, 0, 0),
+            ),
+            role,
+            object_name,
+            enclosing_class,
+            enclosing_method_line,
+        };
+
+        let index_guard = self.symbol_index.read().unwrap();
+        let Some(index) = index_guard.as_ref() else {
+            return Ok(None);
+        };
+        let Some(identity) = index.resolve_usage_identity(&usage, &local_types) else {
+            return Ok(None);
+        };
+        let Some(occurrences) = index.by_identity.get(&identity) else {
+            return Ok(None);
+        };
+
+        let locations: Vec<Location> = occurrences
+            .iter()
+            .filter_map(|(u, span)| {
+                Some(Location {
+                    uri: Url::parse(u).ok()?,
+                    range: span_to_range(span),
+                })
+            })
+            .collect();
+
+        Ok(Some(locations))
     }
 
     async fn document_symbol(
