@@ -218,6 +218,17 @@ fn lint_expression(
             right,
             span,
         } => {
+            // A `+` whose operand is a parenthesized `&&`/`||` crashes the Enforce
+            // compiler ("Formula too complex" → native crash). This is a nesting
+            // trigger, distinct from the chain-length limits below.
+            if operator == "+" && (is_logical_binary(left) || is_logical_binary(right)) {
+                issues.push(LintIssue {
+                    message: "Logical operator (&&/||) nested in a string '+' expression — engine crash"
+                        .to_string(),
+                    line: span.start.line,
+                    is_error: true,
+                });
+            }
             if operator == "+" || operator == "||" || operator == "&&" {
                 // Flag only at the root of a maximal same-operator chain.
                 if parent_op != Some(operator.as_str()) {
@@ -308,6 +319,15 @@ fn chain_operand_count(expr: &Expression, op: &str) -> usize {
     }
 }
 
+/// Whether `expr` is a logical `&&`/`||` binary (a parenthesized operand of a
+/// string `+` crashes the engine).
+fn is_logical_binary(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::Binary { operator, .. } if operator == "&&" || operator == "||"
+    )
+}
+
 /// Flag a `.` whose next token (member) is on a later line — a real syntax error
 /// in Enforce (`A.` newline `B()`).
 fn lint_line_break_after_dot(tokens: &[Token], issues: &mut Vec<LintIssue>) {
@@ -357,6 +377,24 @@ mod tests {
         let code = "void F(bool a,bool b,bool c,bool d,bool e,bool f,bool g,bool h,bool i,bool j) { if (a||b||c||d||e||f||g||h||i||j) {} }";
         let issues = lint_code(code);
         assert!(issues.iter().any(|i| i.message.contains("Chained '||'")));
+    }
+
+    #[test]
+    fn test_logical_nested_in_concat() {
+        // `&&` inside a parenthesized `+` operand → engine crash ("Formula too
+        // complex"). This is a nesting trigger, not a chain-length one.
+        let code = r#"void F(Object a, Object b) { string s = "x=" + (a != null && b != null) + " y"; }"#;
+        let issues = lint_code(code);
+        assert!(issues.iter().any(|i| i.message.contains("Logical operator")));
+    }
+
+    #[test]
+    fn test_logical_at_top_of_concat_not_flagged() {
+        // `&&` binds looser than `+`, so `"x=" + a && b` parses as `("x=" + a) && b`:
+        // the `+` operand is `a` (not a logical), so it must NOT be flagged.
+        let code = r#"void F(bool a, bool b) { bool r = "x=" + a && b; }"#;
+        let issues = lint_code(code);
+        assert!(!issues.iter().any(|i| i.message.contains("Logical operator")));
     }
 
     #[test]
