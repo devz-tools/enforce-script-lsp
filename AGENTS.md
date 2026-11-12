@@ -89,16 +89,19 @@ Handles **two config.cpp styles**: prefix (`my_mod/3_Game`) and full-path
 (`SomeMod/Core/Scripts/3_Game`).
 
 ### 5. Symbol Index (`src/index.rs`)
-`name → Vec<IndexedSymbol{uri, symbol}>` + `class_parents`. Built by walking compiled dirs +
-dependency roots, parsing each `.c`, and extracting **signatures straight from the AST** (no
-`SemanticAnalyzer` pass) — fast and error-tolerant on engine code. `environment()` derives a
-`GlobalEnvironment` used to resolve cross-file identifiers.
+`name → Vec<IndexedSymbol{uri, symbol}>` (definitions) + `class_parents`. Built by walking
+compiled dirs + dependency roots, parsing each `.c`, and extracting **signatures straight from
+the AST** (no `SemanticAnalyzer` pass) — fast and error-tolerant on engine code. It also collects
+identifier *usages* (`by_usage`) and, in a second pass after the whole index is built, resolves
+each usage to a scope-aware identity (`g:`/`m:`/`l:`) into `by_identity` (powers find-references).
+`environment()` derives a `GlobalEnvironment` used to resolve cross-file identifiers.
 
 ### 6. Lint (`src/lint.rs`)
 Enforce-specific checks with thresholds in `LintConfig` (tuned to Enforce engine limits): long
-`+` chain (>15), long `||`/`&&` chain (>8), ternary (forbidden), line break after `.`
-(forbidden), duplicate variable declaration in a method (Enforce has no block scope),
-field/variable shadowing a built-in class name. Each finding is a
+`+` chain (>15), long `||`/`&&` chain (>8), a `&&`/`||` nested inside a string `+` expression
+(a native engine crash — a nesting trigger, distinct from chain length), ternary (forbidden),
+line break after `.` (forbidden), duplicate variable declaration in a method (Enforce has no
+block scope), field/variable shadowing a built-in class name. Each finding is a
 `LintIssue { message, line, is_error }`.
 
 Note: **bitwise operators (`&` `|` `~` `<<` `>>`) ARE supported in Enforce** — there is no
@@ -113,7 +116,7 @@ bitwise lint.
   - Completions for keywords and symbols
   - Hover information showing symbol types and definitions
   - Go-to-definition navigation (cross-file via the index)
-  - Find-references across the document
+  - Find-references, scope-aware and cross-file (global / class member / local identity)
   - Signature help for functions/methods
   - Document symbols (hierarchical outline)
   - Folding ranges for classes
@@ -122,10 +125,11 @@ bitwise lint.
 ## Data flow
 
 ```
-initialize(rootUri, dependencyRoots)
-  └─ Workspace::build(root, deps)   → configs, prefix_map, compiled_dirs, dependency_roots
+initialize(rootUri, dependencyRoots, defaultDefines)
+  └─ Workspace::build(root, deps, default_defines)   → configs, prefix_map, compiled_dirs, dependency_roots
 initialized
-  └─ SymbolIndex::build(&workspace) → by_name, class_parents  (AST-only, "light" indexing)
+  └─ SymbolIndex::build(&workspace) → by_name, class_parents, by_usage, by_identity
+     (built on a blocking thread — async, the server stays responsive while it indexes)
 did_open(file)
   └─ lex (with module defines) → parse → per-file semantic (with GlobalEnvironment) → lint
 ```
@@ -138,7 +142,8 @@ did_open(file)
   `obj.`/`this.`/`super.` resolves the type and offers its members (fields/methods, incl. inherited)
 - **Hover Information** - Display symbol types, kinds, and definitions with Markdown formatting
 - **Go to Definition** - Navigate to symbol definitions using symbol table lookups (cross-file)
-- **Find References** - Find all occurrences of symbols in the current document
+- **Find References** - Find all usages of a symbol, scope-aware and cross-file (resolves a
+  global / class-member / local identity; member access resolves through the object's type)
 - **Signature Help** - Basic parameter hints for functions and methods
 - **Document Symbols** - Hierarchical outline view of classes, methods, enums, and fields
 - **Folding Ranges** - Support for collapsing/expanding classes
@@ -158,6 +163,7 @@ did_open(file)
 - **dashmap** 5.5 - Concurrent hash map for thread-safe document storage
 - **serde** 1.0 + **serde_json** - JSON serialization for LSP protocol
 - **regex** 1.10 - Pattern matching support
+- **url** 2 - URL encoding of indexed file paths (so they match the client's `Url` form)
 
 ## Enforce Script Syntax Reference
 
@@ -167,7 +173,7 @@ did_open(file)
 
 **Location**: Tests are co-located with modules using `#[cfg(test)]` sections
 
-**Current Test Coverage**: 147 tests total.
+**Current Test Coverage**: 178 tests total.
 
 **Running Tests**: 
 ```bash
@@ -210,7 +216,8 @@ cargo check
   indexing. Collect errors into `self.errors`, never print them.
 - `Symbol` carries `parent: Option<String>`: `None` = global, `Some(class)` = member. The
   `environment()` split relies on this.
-- Config is read from `initializationOptions` in `initialize` (currently `dependencyRoots`).
+- Config is read from `initializationOptions` in `initialize` (`dependencyRoots`, `defaultDefines`,
+  `lenientMemberScope`).
 - The parser is validated against real-world DayZ codebases; new syntax must not regress
   `cargo test` nor re-introduce parse errors on real code.
 
@@ -238,7 +245,7 @@ cargo check
 - Position tracking throughout the pipeline for accurate diagnostics
 
 ### Test Quality
-- 147 comprehensive tests with descriptive names
+- 178 comprehensive tests with descriptive names
 - Tests cover all major features and edge cases
 - Both success and failure scenarios tested
 

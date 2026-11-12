@@ -75,9 +75,11 @@ cargo run --release
   - Works with classes, functions, methods, variables
   - Cross-file via the project index
 
-- **Find References** - Find all symbol occurrences
-  - Lists all definitions of a symbol
-  - Document-wide symbol search
+- **Find References** - Find all usages of a symbol, scope-aware and cross-file
+  - Resolves the symbol to a canonical identity — global, class member (field/method),
+    or local variable — so `m_X` in one class isn't conflated with `m_X` in another
+  - Member access (`obj.method`) resolves through the object's declared type
+  - Returns every matching usage across the whole project, not just the current file
 
 - **Signature Help** - Function/method parameter hints
   - Basic signature information
@@ -101,15 +103,22 @@ cargo run --release
 - **"excluded from compilation" warning** — flags a `.c` file that is not under any
   module's `files[]` (the classic "forgot to add the directory to config.cpp" footgun).
 - **defines-aware `#ifdef`** — keeps/skips `#ifdef X`/`#ifndef X`/`#else`/`#endif` branches
-  according to the module's `defines[]` from `config.cpp`.
+  according to the module's `defines[]` from `config.cpp`, plus the `defaultDefines` option.
 - **Cross-file symbol index** — indexes all compiled `.c` files and powers go-to-definition,
-  completion and hover across files (not just the current document).
+  completion, hover, and scope-aware find-references across files (not just the current document).
+  Built asynchronously on a blocking thread so the server stays responsive while it indexes.
 - **`dependencyRoots`** — indexes extra source roots (the vanilla engine scripts and other
   dependency roots) "lightly" (signatures straight from the AST), so engine globals like
   `Math`, `vector`, `GetGame` resolve too.
-- **Enforce-specific lint** (`lint.rs`) — long `+`/`||`/`&&` chains, ternary operator, line
-  break after `.`, a variable declared more than once in a method, and a field/variable named
-  after a built-in class.
+- **`lenientMemberScope`** — opt-in looser scoping where a bare name is treated as defined if
+  it's a member of any class (diagnostics/navigation only).
+- **Engine constants** — a built-in list of engine constants that exist without a script
+  declaration (e.g. `DT_CUSTOM`, input-action constants) is suppressed so they don't read as
+  `undefined identifier`.
+- **Enforce-specific lint** (`lint.rs`) — long `+`/`||`/`&&` chains, a `&&`/`||` nested inside a
+  string `+` expression (a native engine crash), the ternary operator, a line break after `.`,
+  a variable declared more than once in a method, and a field/variable named after a built-in
+  class.
 
 ### 🚧 Partially Implemented
 
@@ -186,7 +195,9 @@ In `opencode.jsonc`:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `dependencyRoots` | `string[]` | `[]` | Extra source roots to index (e.g. the vanilla engine scripts). All `.c` under them are indexed "lightly". |
+| `dependencyRoots` | `string[]` | `[]` | Extra source roots to index (e.g. the vanilla engine scripts). All `.c` under them are indexed "lightly" (signatures from the AST). |
+| `defaultDefines` | `string[]` | `[]` | Preprocessor defines applied to every file (engine feature flags that no `config.cpp` declares, e.g. `FEATURE_NETWORK_RECONCILIATION`). Merged into the per-module `defines[]`. |
+| `lenientMemberScope` | `boolean` | `false` | Treat a bare name as defined if it's a member of *any* class. Affects diagnostics and navigation only — completion always stays strict. |
 
 The project root is taken from the LSP `rootUri` (the opened folder) — no configuration needed
 for a single mod.
@@ -275,8 +286,6 @@ The implementation follows the official Enforce Script syntax as documented in `
 
 ## Current limitations / roadmap
 
-- **`references` (find references)** is still per-document — cross-file needs an index of
-  *usages*, not just definitions.
 - **Member completion after `.`** — resolves `obj.`/`this.`/`super.` to the type's members, but
   does not yet resolve the return type of a method call (`GetWeapon().`) or primitive members
   (`vector.Zero`).
@@ -285,11 +294,11 @@ The implementation follows the official Enforce Script syntax as documented in `
   the base `class X : Parent`, breaking the inheritance chain. Separately, `Symbol 'X' already
   defined` is a per-file scope error (the same name declared twice in one file — e.g. a global
   function overload), not a cross-file merge issue.
-- **C++ natives** — engine-only symbols (e.g. a native method with no script declaration) are
-  reported as `undefined identifier` (a warning, not an error). There's no hardcoded "known
-  engine globals" list yet.
-- The index is built synchronously in `initialized`; fine for a mod, but large dependency
-  roots warrant `spawn_blocking`.
+- **Engine-only functions** — engine constants are covered by a built-in list, but engine
+  *functions* (`IsInherited`, `IsKindOf`, `GetGame`, …) are not, and still read as
+  `undefined identifier` (a warning, not an error).
+- **Persistent index cache** — the index is rebuilt from source on every start; a disk cache
+  with per-file `mtime`/`size` fingerprints would skip re-parsing unchanged files on cold starts.
 
 ## 🤝 Contributing
 
