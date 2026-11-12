@@ -334,7 +334,11 @@ impl Backend {
                 _ => None,
             }
         } else {
-            resolve_type_name(&object, doc, index)
+            let enclosing = doc
+                .program
+                .as_ref()
+                .and_then(|p| enclosing_class(p, position));
+            resolve_type_name(&object, doc, index, enclosing.as_deref())
         };
         let Some(type_name) = type_name else {
             return Vec::new();
@@ -363,7 +367,11 @@ impl Backend {
                         _ => None,
                     }
                 } else {
-                    resolve_type_name(&object, &doc, index)
+                    let enclosing = doc
+                        .program
+                        .as_ref()
+                        .and_then(|p| enclosing_class(p, position));
+                    resolve_type_name(&object, &doc, index, enclosing.as_deref())
                 };
                 if let Some(type_name) = type_name {
                     if let Some(symbol_table) = doc.symbol_table.as_ref()
@@ -824,9 +832,22 @@ fn is_class_type(name: &str, index: &SymbolIndex) -> bool {
         .any(|occ| occ.symbol.kind == SymbolKind::Class)
 }
 
+/// Whether `name` is a known enum type (has an Enum symbol).
+fn is_enum_type(name: &str, index: &SymbolIndex) -> bool {
+    index
+        .lookup(name)
+        .iter()
+        .any(|occ| occ.symbol.kind == SymbolKind::Enum)
+}
+
 /// Resolve the type name of a member-access object (a local/field/parameter with
-/// a class type, or a class name used for static access).
-fn resolve_type_name(object: &str, doc: &DocumentData, index: &SymbolIndex) -> Option<String> {
+/// a class type, or a class/enum name used for static access).
+fn resolve_type_name(
+    object: &str,
+    doc: &DocumentData,
+    index: &SymbolIndex,
+    enclosing: Option<&str>,
+) -> Option<String> {
     // 1. Object is a field/variable/parameter → its declared type.
     if let Some(st) = &doc.symbol_table {
         for s in st.get_all_symbols() {
@@ -845,9 +866,28 @@ fn resolve_type_name(object: &str, doc: &DocumentData, index: &SymbolIndex) -> O
         }
     }
 
-    // 2. Object is a class name (static member access).
-    if is_class_type(object, index) {
+    // 2. Object is a class or enum name (static member access).
+    if is_class_type(object, index) || is_enum_type(object, index) {
         return Some(object.to_string());
+    }
+
+    // 3. Object is a field/variable/parameter inherited from an ancestor class
+    //    (declared in another file, so absent from this document's symbol table).
+    if let Some(class) = enclosing {
+        for ancestor in ancestry_chain(class, index) {
+            if let Some(occ) = index.lookup(object).iter().find(|occ| {
+                matches!(
+                    occ.symbol.kind,
+                    SymbolKind::Field | SymbolKind::Variable | SymbolKind::Parameter
+                ) && occ.symbol.parent.as_deref() == Some(ancestor.as_str())
+            }) && let Some(t) = &occ.symbol.type_ref
+            {
+                let name = type_ref_base_name(t);
+                if is_class_type(&name, index) || is_enum_type(&name, index) {
+                    return Some(name);
+                }
+            }
+        }
     }
 
     None
@@ -877,6 +917,24 @@ fn is_class_member_of(symbol: &Symbol, class: &str) -> bool {
         && symbol.parent.as_deref() == Some(class)
 }
 
+/// Build a completion item for a member. Enum variants are indexed with a
+/// dotted `Enum.Variant` name; strip the enum prefix so the completion offers
+/// the bare `Variant`.
+fn member_completion_item(symbol: &Symbol) -> CompletionItem {
+    let mut item = symbol_to_completion(symbol);
+    if symbol.kind == SymbolKind::EnumVariant
+        && let Some(parent) = &symbol.parent
+    {
+        let prefix = format!("{}.", parent);
+        item.label = symbol
+            .name
+            .strip_prefix(&prefix)
+            .unwrap_or(&symbol.name)
+            .to_string();
+    }
+    item
+}
+
 /// Collect the members of `type_name` (walking the inheritance chain) as
 /// completion items, filtered by `partial`. Sources: the cross-file index
 /// (for inherited/other-file members) and the current document's symbol table
@@ -896,12 +954,14 @@ fn collect_members(
     // 1. From the cross-file index.
     for occs in index.by_name.values() {
         for occ in occs {
-            if matches!(occ.symbol.kind, SymbolKind::Field | SymbolKind::Method)
-                && let Some(parent) = &occ.symbol.parent
+            if matches!(
+                occ.symbol.kind,
+                SymbolKind::Field | SymbolKind::Method | SymbolKind::EnumVariant
+            ) && let Some(parent) = &occ.symbol.parent
                 && chain.contains(parent)
                 && seen.insert(occ.symbol.name.clone())
             {
-                items.push(symbol_to_completion(&occ.symbol));
+                items.push(member_completion_item(&occ.symbol));
             }
         }
     }
@@ -909,12 +969,14 @@ fn collect_members(
     // 2. From the current document (fresh members, in case the file is mid-edit).
     if let Some(st) = &doc.symbol_table {
         for s in st.get_all_symbols() {
-            if matches!(s.kind, SymbolKind::Field | SymbolKind::Method)
-                && let Some(parent) = &s.parent
+            if matches!(
+                s.kind,
+                SymbolKind::Field | SymbolKind::Method | SymbolKind::EnumVariant
+            ) && let Some(parent) = &s.parent
                 && chain.contains(parent)
                 && seen.insert(s.name.clone())
             {
-                items.push(symbol_to_completion(s));
+                items.push(member_completion_item(s));
             }
         }
     }
@@ -940,6 +1002,7 @@ fn find_member_in_hierarchy<'a>(
         .lookup(name)
         .iter()
         .find(|occ| occ.symbol.parent.as_ref().is_some_and(|p| chain.contains(p)))
+        .or_else(|| index.lookup(&format!("{}.{}", class, name)).first())
 }
 
 #[tower_lsp::async_trait]
@@ -1207,7 +1270,11 @@ impl LanguageServer for Backend {
                         _ => None,
                     }
                 } else {
-                    resolve_type_name(&object, &doc, index)
+                    let enclosing = doc
+                        .program
+                        .as_ref()
+                        .and_then(|p| enclosing_class(p, position));
+                    resolve_type_name(&object, &doc, index, enclosing.as_deref())
                 };
                 if let Some(type_name) = type_name {
                     if let Some(symbol_table) = doc.symbol_table.as_ref()
