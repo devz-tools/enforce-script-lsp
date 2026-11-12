@@ -909,7 +909,7 @@ impl Parser {
 
         let mut modifiers = Vec::new();
         loop {
-            if self.match_token(&[TokenType::Ref, TokenType::Autoptr]) {
+            if self.match_token(&[TokenType::Ref, TokenType::Autoptr, TokenType::Out, TokenType::Inout]) {
                 if let Some(token) = self.previous() {
                     modifiers.push(token.lexeme.clone());
                 }
@@ -3175,6 +3175,21 @@ class Entity
         let mut parser = Parser::new(tokens);
         let result = parser.parse();
         assert!(result.is_ok(), "expected external modifier to parse, got {:?}", result);
+    }
+
+    #[test]
+    fn test_parse_notnull_out_array_param() {
+        // `notnull out array<LOD> lods` — the identifier modifier (`notnull`)
+        // appears before `out`. parse_type must consume `out` as a modifier so
+        // it doesn't fail with "Expected type, got Out".
+        let code = r#"
+class Foo { proto native bool GetLODS(notnull out array<LOD> lods); }
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+        assert!(result.is_ok(), "expected notnull out array param to parse, got {:?}", result);
     }
 
     #[test]
