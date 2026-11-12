@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::lexer::Lexer;
@@ -73,6 +73,20 @@ fn is_primitive_type(name: &str) -> bool {
     matches!(name, "int" | "float" | "bool" | "string" | "vector" | "void")
 }
 
+/// Precomputed lookup structures derived from `by_name` once, so per-usage
+/// identity resolution is O(chain depth) with O(1) member lookups instead of
+/// linear scans over every occurrence of a name.
+struct ResolveContext {
+    /// class/enum name → member bare names (fields, methods, enum variants).
+    class_members: HashMap<String, HashSet<String>>,
+    /// Global names (classes, enums, functions, global variables).
+    globals: HashSet<String>,
+    /// Class/enum names (static-access targets).
+    types: HashSet<String>,
+    /// class name → field name → base type name.
+    class_field_types: HashMap<String, HashMap<String, String>>,
+}
+
 impl SymbolIndex {
     /// Parse every compiled `.c` file (project + dependency roots) and collect
     /// its symbols ("лайтово": signatures straight from the AST, no semantic pass).
@@ -127,12 +141,80 @@ impl SymbolIndex {
         env
     }
 
-    /// Compute the canonical identity for one usage, using the index plus the
-    /// file's local variable/parameter types.
+    /// Build the resolve context: precomputed member/global/type/field maps
+    /// derived from `by_name`, so per-usage resolution is O(chain depth) with
+    /// O(1) lookups instead of scanning every occurrence of a name.
+    fn build_resolve_context(&self) -> ResolveContext {
+        let mut class_members: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut globals: HashSet<String> = HashSet::new();
+        let mut types: HashSet<String> = HashSet::new();
+        let mut class_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for (name, occs) in &self.by_name {
+            for occ in occs {
+                match &occ.symbol.parent {
+                    Some(parent) => match occ.symbol.kind {
+                        SymbolKind::EnumVariant => {
+                            // Indexed as "Enum.Variant"; register the bare name.
+                            let bare = name
+                                .strip_prefix(&format!("{}.", parent))
+                                .unwrap_or(name.as_str())
+                                .to_string();
+                            class_members.entry(parent.clone()).or_default().insert(bare);
+                        }
+                        SymbolKind::Field | SymbolKind::Method => {
+                            class_members
+                                .entry(parent.clone())
+                                .or_default()
+                                .insert(name.clone());
+                        }
+                        _ => {}
+                    },
+                    None => match occ.symbol.kind {
+                        SymbolKind::Class | SymbolKind::Enum => {
+                            globals.insert(name.clone());
+                            types.insert(name.clone());
+                        }
+                        SymbolKind::Function | SymbolKind::Variable => {
+                            globals.insert(name.clone());
+                        }
+                        _ => {}
+                    },
+                }
+                if let Some(parent) = &occ.symbol.parent
+                    && matches!(occ.symbol.kind, SymbolKind::Field | SymbolKind::Variable)
+                    && let Some(t) = &occ.symbol.type_ref
+                {
+                    class_field_types
+                        .entry(parent.clone())
+                        .or_default()
+                        .insert(name.clone(), type_ref_base_name(t));
+                }
+            }
+        }
+        ResolveContext {
+            class_members,
+            globals,
+            types,
+            class_field_types,
+        }
+    }
+
+    /// Compute the canonical identity for one usage (public entry point; builds
+    /// the resolve context on demand — used by the single-usage handler).
     pub fn resolve_usage_identity(
         &self,
         usage: &IndexedUsage,
         local_types: &HashMap<String, String>,
+    ) -> Option<String> {
+        let ctx = self.build_resolve_context();
+        self.resolve_usage_identity_ctx(usage, local_types, &ctx)
+    }
+
+    fn resolve_usage_identity_ctx(
+        &self,
+        usage: &IndexedUsage,
+        local_types: &HashMap<String, String>,
+        ctx: &ResolveContext,
     ) -> Option<String> {
         match usage.role {
             UsageRole::Type => {
@@ -142,19 +224,19 @@ impl SymbolIndex {
                     Some(format!("g:{}", usage.name))
                 }
             }
-            UsageRole::Bare | UsageRole::MemberObject => self.resolve_bare_identity(usage),
-            UsageRole::MemberMember => self.resolve_member_identity(usage, local_types),
+            UsageRole::Bare | UsageRole::MemberObject => self.resolve_bare_identity(usage, ctx),
+            UsageRole::MemberMember => self.resolve_member_identity(usage, local_types, ctx),
         }
     }
 
     /// Bare / object identifier: member of enclosing class → global → local.
-    fn resolve_bare_identity(&self, usage: &IndexedUsage) -> Option<String> {
+    fn resolve_bare_identity(&self, usage: &IndexedUsage, ctx: &ResolveContext) -> Option<String> {
         if let Some(class) = &usage.enclosing_class {
-            if let Some(declaring) = self.find_declaring_class(class, &usage.name) {
+            if let Some(declaring) = self.find_declaring_class(class, &usage.name, ctx) {
                 return Some(format!("m:{}:{}", declaring, usage.name));
             }
         }
-        if self.is_global(&usage.name) {
+        if ctx.globals.contains(&usage.name) {
             return Some(format!("g:{}", usage.name));
         }
         Some(format!(
@@ -171,10 +253,11 @@ impl SymbolIndex {
         &self,
         usage: &IndexedUsage,
         local_types: &HashMap<String, String>,
+        ctx: &ResolveContext,
     ) -> Option<String> {
         let object = usage.object_name.as_deref()?;
-        let object_type = self.resolve_object_type(object, usage, local_types)?;
-        let declaring = self.find_declaring_class(&object_type, &usage.name)?;
+        let object_type = self.resolve_object_type(object, usage, local_types, ctx)?;
+        let declaring = self.find_declaring_class(&object_type, &usage.name, ctx)?;
         Some(format!("m:{}:{}", declaring, usage.name))
     }
 
@@ -185,58 +268,34 @@ impl SymbolIndex {
         object: &str,
         usage: &IndexedUsage,
         local_types: &HashMap<String, String>,
+        ctx: &ResolveContext,
     ) -> Option<String> {
-        if self.is_type_name(object) {
+        if self.class_parents.contains_key(object) || ctx.types.contains(object) {
             return Some(object.to_string());
         }
         if let Some(t) = local_types.get(object) {
             return Some(t.clone());
         }
         if let Some(class) = &usage.enclosing_class {
-            if let Some(t) = self.find_field_type(class, object) {
+            if let Some(t) = self.find_field_type(class, object, ctx) {
                 return Some(t);
             }
         }
         None
     }
 
-    /// Whether `name` is a class or enum (a static access target).
-    fn is_type_name(&self, name: &str) -> bool {
-        if self.class_parents.contains_key(name) {
-            return true;
-        }
-        if let Some(occs) = self.by_name.get(name) {
-            return occs
-                .iter()
-                .any(|o| matches!(o.symbol.kind, SymbolKind::Class | SymbolKind::Enum));
-        }
-        false
-    }
-
-    /// Whether `name` is a global (class/enum/function/global variable).
-    fn is_global(&self, name: &str) -> bool {
-        if let Some(occs) = self.by_name.get(name) {
-            return occs.iter().any(|o| {
-                o.symbol.parent.is_none()
-                    && matches!(
-                        o.symbol.kind,
-                        SymbolKind::Class
-                            | SymbolKind::Enum
-                            | SymbolKind::Function
-                            | SymbolKind::Variable
-                    )
-            });
-        }
-        false
-    }
-
     /// Find the nearest ancestor of `class` that declares a member `name`
     /// (field, method, or enum variant); return that declaring class/enum.
-    fn find_declaring_class(&self, class: &str, name: &str) -> Option<String> {
+    fn find_declaring_class(
+        &self,
+        class: &str,
+        name: &str,
+        ctx: &ResolveContext,
+    ) -> Option<String> {
         let mut current = Some(class.to_string());
         let mut guard = 0;
         while let Some(c) = current {
-            if self.class_has_member(&c, name) {
+            if ctx.class_members.get(&c).is_some_and(|m| m.contains(name)) {
                 return Some(c);
             }
             current = self.class_parents.get(&c).cloned().flatten();
@@ -248,45 +307,13 @@ impl SymbolIndex {
         None
     }
 
-    /// Whether `class` (or enum) declares a member `name` directly.
-    fn class_has_member(&self, class: &str, name: &str) -> bool {
-        if let Some(occs) = self.by_name.get(name) {
-            for occ in occs {
-                if occ.symbol.parent.as_deref() == Some(class)
-                    && matches!(occ.symbol.kind, SymbolKind::Field | SymbolKind::Method)
-                {
-                    return true;
-                }
-            }
-        }
-        // Enum variant: indexed as `Enum.Variant` with parent == Enum.
-        if let Some(occs) = self.by_name.get(&format!("{}.{}", class, name)) {
-            for occ in occs {
-                if occ.symbol.parent.as_deref() == Some(class)
-                    && occ.symbol.kind == SymbolKind::EnumVariant
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// Find the type of a field `name` declared in `class` or its ancestors.
-    fn find_field_type(&self, class: &str, name: &str) -> Option<String> {
+    fn find_field_type(&self, class: &str, name: &str, ctx: &ResolveContext) -> Option<String> {
         let mut current = Some(class.to_string());
         let mut guard = 0;
         while let Some(c) = current {
-            if let Some(occs) = self.by_name.get(name) {
-                for occ in occs {
-                    if occ.symbol.parent.as_deref() == Some(c.as_str())
-                        && matches!(occ.symbol.kind, SymbolKind::Field | SymbolKind::Variable)
-                    {
-                        if let Some(t) = &occ.symbol.type_ref {
-                            return Some(type_ref_base_name(t));
-                        }
-                    }
-                }
+            if let Some(t) = ctx.class_field_types.get(&c).and_then(|f| f.get(name)) {
+                return Some(t.clone());
             }
             current = self.class_parents.get(&c).cloned().flatten();
             guard += 1;
@@ -513,15 +540,13 @@ impl SymbolIndex {
     /// Second pass: resolve every usage's identity now that the full index is
     /// built, and populate `by_identity`. Must run after all files are indexed.
     pub fn resolve_identities(&mut self) {
+        let ctx = self.build_resolve_context();
+        let empty = HashMap::new();
         let mut by_identity: HashMap<String, Vec<(String, Span)>> = HashMap::new();
         for usages in self.by_usage.values() {
             for usage in usages {
-                let local_types = self
-                    .by_local_types
-                    .get(&usage.uri)
-                    .cloned()
-                    .unwrap_or_default();
-                if let Some(identity) = self.resolve_usage_identity(usage, &local_types) {
+                let local_types = self.by_local_types.get(&usage.uri).unwrap_or(&empty);
+                if let Some(identity) = self.resolve_usage_identity_ctx(usage, local_types, &ctx) {
                     by_identity
                         .entry(identity)
                         .or_default()
