@@ -329,7 +329,12 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
         return;
     };
 
-    let uri = format!("file://{}", path.display());
+    // URL-encode the path (e.g. spaces in "DayZ Projects") so the indexed uri
+    // matches the client's `Url` form; otherwise `l:` local identities (which
+    // embed the uri) mismatch for vanilla files with spaces in their path.
+    let uri = url::Url::from_file_path(path)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| format!("file://{}", path.display()));
     index_program(&program, &uri, index);
 }
 
