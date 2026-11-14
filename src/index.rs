@@ -66,6 +66,9 @@ pub struct SymbolIndex {
     /// Per-file local variable/parameter types (uri → name → base type name),
     /// used to resolve a `MemberMember` object's type during the second pass.
     by_local_types: HashMap<String, HashMap<String, String>>,
+    /// Set when a file is re-indexed: `by_identity` is out of date and must be
+    /// recomputed before find-references reads it.
+    by_identity_stale: bool,
 }
 
 /// Primitive types are not indexed as `g:` identities.
@@ -347,12 +350,7 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
     // them with U+FFFD instead of skipping the whole file.
     let text = String::from_utf8_lossy(&bytes).into_owned();
 
-    let mut lexer = Lexer::new(&text);
-    lexer.set_active_defines(&workspace.defines_for(path));
-    let tokens = lexer.tokenize();
-
-    let mut parser = Parser::new(tokens);
-    let Ok(program) = parser.parse() else {
+    let Some(program) = parse_program(&text, &workspace.defines_for(path)) else {
         return;
     };
 
@@ -363,6 +361,15 @@ fn index_file(path: &Path, workspace: &Workspace, index: &mut SymbolIndex) {
         .map(|u| u.to_string())
         .unwrap_or_else(|_| format!("file://{}", path.display()));
     index_program(&program, &uri, index);
+}
+
+/// Lex + parse a file's text into a Program (None on a parse error).
+fn parse_program(text: &str, defines: &HashSet<String>) -> Option<Program> {
+    let mut lexer = Lexer::new(text);
+    lexer.set_active_defines(defines);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::new(tokens);
+    parser.parse().ok()
 }
 
 /// Index one parsed file: register definitions (`by_name`, `class_parents`),
@@ -555,6 +562,55 @@ impl SymbolIndex {
             }
         }
         self.by_identity = by_identity;
+        self.by_identity_stale = false;
+    }
+
+    /// Recompute `by_identity` if a file changed since it was last resolved.
+    pub fn ensure_identities(&mut self) {
+        if self.by_identity_stale {
+            self.resolve_identities();
+        }
+    }
+
+    /// Drop every symbol/usage/local-type this file contributed, and mark
+    /// `by_identity` stale (it depends on the whole project).
+    pub fn remove_file(&mut self, uri: &str) {
+        // Classes declared here must leave `class_parents`.
+        let classes: Vec<String> = self
+            .by_name
+            .iter()
+            .filter(|(_, occs)| {
+                occs.iter()
+                    .any(|o| o.uri == uri && o.symbol.kind == SymbolKind::Class)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for c in classes {
+            self.class_parents.remove(&c);
+        }
+
+        for occs in self.by_name.values_mut() {
+            occs.retain(|o| o.uri != uri);
+        }
+        self.by_name.retain(|_, v| !v.is_empty());
+
+        for usages in self.by_usage.values_mut() {
+            usages.retain(|u| u.uri != uri);
+        }
+        self.by_usage.retain(|_, v| !v.is_empty());
+
+        self.by_local_types.remove(uri);
+
+        self.by_identity.clear();
+        self.by_identity_stale = true;
+    }
+
+    /// Parse and index a single file's text (for `didOpen`/`didChange`).
+    pub fn index_text(&mut self, uri: &str, text: &str, defines: &HashSet<String>) {
+        let Some(program) = parse_program(text, defines) else {
+            return;
+        };
+        index_program(&program, uri, self);
     }
 }
 

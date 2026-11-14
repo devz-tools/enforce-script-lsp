@@ -1,8 +1,9 @@
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Duration;
 /// LSP Server implementation for Enforce Script
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -19,8 +20,13 @@ pub struct Backend {
     client: Client,
     documents: Arc<DashMap<String, DocumentData>>,
     workspace: Arc<RwLock<Option<Workspace>>>,
-    symbol_index: Arc<RwLock<Option<Arc<SymbolIndex>>>>,
+    symbol_index: Arc<RwLock<Option<SymbolIndex>>>,
     lenient_member_scope: Arc<AtomicBool>,
+    /// Files edited but not yet re-indexed (uri → latest text), drained by the
+    /// debounced re-index task.
+    dirty: Arc<DashMap<String, String>>,
+    /// Debounce generation: only the latest didChange triggers a re-index.
+    reindex_gen: Arc<AtomicU64>,
 }
 
 struct DocumentData {
@@ -39,23 +45,100 @@ impl Backend {
             workspace: Arc::new(RwLock::new(None)),
             symbol_index: Arc::new(RwLock::new(None)),
             lenient_member_scope: Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(DashMap::new()),
+            reindex_gen: Arc::new(AtomicU64::new(0)),
         }
     }
 
     async fn analyze_document(&self, uri: &str, text: &str) {
-        // Determine active defines from the file's module config.cpp, so #ifdef
-        // branches are kept/skipped correctly.
-        let defines: HashSet<String> = Url::parse(uri)
+        Self::analyze_document_impl(
+            uri,
+            text,
+            &self.workspace,
+            &self.symbol_index,
+            &self.lenient_member_scope,
+            &self.documents,
+            &self.client,
+        )
+        .await;
+    }
+
+    /// Determine active defines for a document uri (from its module `config.cpp`).
+    fn defines_for_uri(uri: &str, workspace: &Arc<RwLock<Option<Workspace>>>) -> HashSet<String> {
+        Url::parse(uri)
             .ok()
             .and_then(|u| u.to_file_path().ok())
             .and_then(|path| {
-                self.workspace
+                workspace
                     .read()
                     .unwrap()
                     .as_ref()
                     .map(|ws| ws.defines_for(&path))
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// Debounce the re-index: after the last change, re-index the dirty files and
+    /// re-analyze open documents so cross-file symbols (and diagnostics) settle.
+    fn schedule_reindex(&self) {
+        let generation = self.reindex_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let dirty = self.dirty.clone();
+        let gen_counter = self.reindex_gen.clone();
+        let workspace = self.workspace.clone();
+        let symbol_index = self.symbol_index.clone();
+        let lenient_member_scope = self.lenient_member_scope.clone();
+        let documents = self.documents.clone();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if generation != gen_counter.load(Ordering::SeqCst) {
+                return; // a newer change superseded this one
+            }
+            let changed: Vec<(String, String)> = dirty
+                .iter()
+                .map(|d| (d.key().clone(), d.value().clone()))
+                .collect();
+            dirty.clear();
+            {
+                let mut guard = symbol_index.write().unwrap();
+                if let Some(index) = guard.as_mut() {
+                    for (uri, text) in &changed {
+                        let defines = Backend::defines_for_uri(uri, &workspace);
+                        index.remove_file(uri);
+                        index.index_text(uri, text, &defines);
+                    }
+                }
+            }
+            // Re-analyze open documents so their diagnostics reflect the new index.
+            let open: Vec<(String, String)> = documents
+                .iter()
+                .map(|d| (d.key().clone(), d.value().text.clone()))
+                .collect();
+            for (uri, text) in open {
+                Backend::analyze_document_impl(
+                    &uri,
+                    &text,
+                    &workspace,
+                    &symbol_index,
+                    &lenient_member_scope,
+                    &documents,
+                    &client,
+                )
+                .await;
+            }
+        });
+    }
+
+    async fn analyze_document_impl(
+    uri: &str,
+    text: &str,
+    workspace: &Arc<RwLock<Option<Workspace>>>,
+    symbol_index: &Arc<RwLock<Option<SymbolIndex>>>,
+    lenient_member_scope: &Arc<AtomicBool>,
+    documents: &Arc<DashMap<String, DocumentData>>,
+    client: &Client,
+) {
+    let defines = Self::defines_for_uri(uri, workspace);
 
         let mut lexer = Lexer::new(text);
         lexer.set_active_defines(&defines);
@@ -97,13 +180,13 @@ impl Backend {
             // the index is still building, suppress "undefined identifier"
             // warnings — cross-file symbols would otherwise read as undefined.
             let index_ready = {
-                let index = self.symbol_index.read().unwrap();
+                let index = symbol_index.read().unwrap();
                 if let Some(index) = index.as_ref() {
                     analyzer.set_global_environment(index.environment());
                 }
                 index.is_some()
             };
-            analyzer.set_lenient_member_scope(self.lenient_member_scope.load(Ordering::Relaxed));
+            analyzer.set_lenient_member_scope(lenient_member_scope.load(Ordering::Relaxed));
             analyzer.set_suppress_undefined(!index_ready);
             match analyzer.analyze(prog) {
                 Ok(_) => {
@@ -134,7 +217,7 @@ impl Backend {
             }
         }
 
-        self.documents.insert(
+        documents.insert(
             uri.to_string(),
             DocumentData {
                 text: text.to_string(),
@@ -145,7 +228,7 @@ impl Backend {
         );
 
         // Warn when a script file is not under any compiled directory (config.cpp files[]).
-        if let Some(ws) = self.workspace.read().unwrap().as_ref() {
+        if let Some(ws) = workspace.read().unwrap().as_ref() {
             if let Ok(url) = Url::parse(uri) {
                 if let Ok(path) = url.to_file_path() {
                     let is_config =
@@ -171,7 +254,7 @@ impl Backend {
 
         // Publish diagnostics
         let uri_parsed = Url::parse(uri).unwrap_or_else(|_| Url::parse("file:///unknown").unwrap());
-        self.client
+        client
             .publish_diagnostics(uri_parsed, diagnostics, None)
             .await;
     }
@@ -1124,7 +1207,7 @@ impl LanguageServer for Backend {
             return;
         };
         let n = index.by_name.len();
-        *self.symbol_index.write().unwrap() = Some(Arc::new(index));
+        *self.symbol_index.write().unwrap() = Some(index);
 
         // Re-analyze documents opened while the index was building, so their
         // diagnostics get cross-file resolution (they were analyzed without it).
@@ -1153,12 +1236,17 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         let text = params.text_document.text;
         self.analyze_document(&uri, &text).await;
+        // The file's text may differ from the index (edited on disk since start).
+        self.dirty.insert(uri, text);
+        self.schedule_reindex();
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         if let Some(change) = params.content_changes.into_iter().next() {
             self.analyze_document(&uri, &change.text).await;
+            self.dirty.insert(uri, change.text);
+            self.schedule_reindex();
         }
     }
 
@@ -1166,7 +1254,6 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         self.documents.remove(&uri);
     }
-
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri.to_string();
         let position = params.text_document_position.position;
@@ -1454,6 +1541,15 @@ impl LanguageServer for Backend {
             enclosing_class,
             enclosing_method_line,
         };
+
+        // Ensure identities are up to date (a file may have changed since the
+        // index was last resolved).
+        {
+            let mut guard = self.symbol_index.write().unwrap();
+            if let Some(index) = guard.as_mut() {
+                index.ensure_identities();
+            }
+        }
 
         let index_guard = self.symbol_index.read().unwrap();
         let Some(index) = index_guard.as_ref() else {
