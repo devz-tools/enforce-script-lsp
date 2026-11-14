@@ -1,17 +1,34 @@
 use dashmap::DashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::time::Duration;
 /// LSP Server implementation for Enforce Script
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::lexer::Lexer;
-use crate::parser::{Class, Declaration, Parser, Program};
-use crate::semantic::{SemanticAnalyzer, SymbolKind, SymbolTable};
+use crate::index::{IndexedSymbol, IndexedUsage, SymbolIndex, UsageRole};
+use crate::lint::{lint, LintConfig, LintIssue};
+use crate::parser::{
+    type_ref_base_name, Class, Declaration, Expression, Parser, Program, Span, Statement,
+};
+use crate::semantic::{SemanticAnalyzer, Symbol, SymbolKind, SymbolTable};
+use crate::workspace::Workspace;
 
 pub struct Backend {
     client: Client,
     documents: Arc<DashMap<String, DocumentData>>,
+    workspace: Arc<RwLock<Option<Workspace>>>,
+    symbol_index: Arc<RwLock<Option<SymbolIndex>>>,
+    lenient_member_scope: Arc<AtomicBool>,
+    /// Files edited but not yet re-indexed (uri → latest text), drained by the
+    /// debounced re-index task.
+    dirty: Arc<DashMap<String, String>>,
+    /// Debounce generation: only the latest didChange triggers a re-index.
+    reindex_gen: Arc<AtomicU64>,
 }
 
 struct DocumentData {
@@ -27,12 +44,108 @@ impl Backend {
         Backend {
             client,
             documents: Arc::new(DashMap::new()),
+            workspace: Arc::new(RwLock::new(None)),
+            symbol_index: Arc::new(RwLock::new(None)),
+            lenient_member_scope: Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(DashMap::new()),
+            reindex_gen: Arc::new(AtomicU64::new(0)),
         }
     }
 
     async fn analyze_document(&self, uri: &str, text: &str) {
+        Self::analyze_document_impl(
+            uri,
+            text,
+            &self.workspace,
+            &self.symbol_index,
+            &self.lenient_member_scope,
+            &self.documents,
+            &self.client,
+        )
+        .await;
+    }
+
+    /// Determine active defines for a document uri (from its module `config.cpp`).
+    fn defines_for_uri(uri: &str, workspace: &Arc<RwLock<Option<Workspace>>>) -> HashSet<String> {
+        Url::parse(uri)
+            .ok()
+            .and_then(|u| u.to_file_path().ok())
+            .and_then(|path| {
+                workspace
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .map(|ws| ws.defines_for(&path))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Debounce the re-index: after the last change, re-index the dirty files and
+    /// re-analyze open documents so cross-file symbols (and diagnostics) settle.
+    fn schedule_reindex(&self) {
+        let generation = self.reindex_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let dirty = self.dirty.clone();
+        let gen_counter = self.reindex_gen.clone();
+        let workspace = self.workspace.clone();
+        let symbol_index = self.symbol_index.clone();
+        let lenient_member_scope = self.lenient_member_scope.clone();
+        let documents = self.documents.clone();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if generation != gen_counter.load(Ordering::SeqCst) {
+                return; // a newer change superseded this one
+            }
+            let changed: Vec<(String, String)> = dirty
+                .iter()
+                .map(|d| (d.key().clone(), d.value().clone()))
+                .collect();
+            dirty.clear();
+            {
+                let mut guard = symbol_index.write().unwrap();
+                if let Some(index) = guard.as_mut() {
+                    for (uri, text) in &changed {
+                        let defines = Backend::defines_for_uri(uri, &workspace);
+                        index.remove_file(uri);
+                        index.index_text(uri, text, &defines);
+                    }
+                }
+            }
+            // Re-analyze open documents so their diagnostics reflect the new index.
+            let open: Vec<(String, String)> = documents
+                .iter()
+                .map(|d| (d.key().clone(), d.value().text.clone()))
+                .collect();
+            for (uri, text) in open {
+                Backend::analyze_document_impl(
+                    &uri,
+                    &text,
+                    &workspace,
+                    &symbol_index,
+                    &lenient_member_scope,
+                    &documents,
+                    &client,
+                )
+                .await;
+            }
+        });
+    }
+
+    async fn analyze_document_impl(
+    uri: &str,
+    text: &str,
+    workspace: &Arc<RwLock<Option<Workspace>>>,
+    symbol_index: &Arc<RwLock<Option<SymbolIndex>>>,
+    lenient_member_scope: &Arc<AtomicBool>,
+    documents: &Arc<DashMap<String, DocumentData>>,
+    client: &Client,
+) {
+    let defines = Self::defines_for_uri(uri, workspace);
+
         let mut lexer = Lexer::new(text);
+        lexer.set_active_defines(&defines);
         let tokens = lexer.tokenize();
+        let tokens_for_lint = tokens.clone();
 
         let mut diagnostics = Vec::new();
 
@@ -43,6 +156,10 @@ impl Backend {
                 for error in parser.get_errors() {
                     diagnostics.push(create_diagnostic(error.clone(), DiagnosticSeverity::ERROR));
                 }
+                // Missing-`;` automatic-semicolon-insertion warnings.
+                for warning in parser.get_warnings() {
+                    diagnostics.push(create_diagnostic(warning.clone(), DiagnosticSeverity::WARNING));
+                }
                 Some(prog)
             }
             Err(e) => {
@@ -52,12 +169,27 @@ impl Backend {
                 for error in parser.get_errors() {
                     diagnostics.push(create_diagnostic(error.clone(), DiagnosticSeverity::ERROR));
                 }
+                for warning in parser.get_warnings() {
+                    diagnostics.push(create_diagnostic(warning.clone(), DiagnosticSeverity::WARNING));
+                }
                 None
             }
         };
 
         let symbol_table = if let Some(ref prog) = program {
             let mut analyzer = SemanticAnalyzer::new();
+            // Resolve cross-file identifiers (globals, inherited members). While
+            // the index is still building, suppress "undefined identifier"
+            // warnings — cross-file symbols would otherwise read as undefined.
+            let index_ready = {
+                let index = symbol_index.read().unwrap();
+                if let Some(index) = index.as_ref() {
+                    analyzer.set_global_environment(index.environment());
+                }
+                index.is_some()
+            };
+            analyzer.set_lenient_member_scope(lenient_member_scope.load(Ordering::Relaxed));
+            analyzer.set_suppress_undefined(!index_ready);
             match analyzer.analyze(prog) {
                 Ok(_) => {
                     // Add warnings as diagnostics
@@ -80,7 +212,14 @@ impl Backend {
             None
         };
 
-        self.documents.insert(
+        // Enforce-specific lint checks (chained operators, line break after '.', ...).
+        if let Some(ref prog) = program {
+            for issue in lint(prog, &tokens_for_lint, &LintConfig::default()) {
+                diagnostics.push(lint_issue_to_diagnostic(issue));
+            }
+        }
+
+        documents.insert(
             uri.to_string(),
             DocumentData {
                 text: text.to_string(),
@@ -90,15 +229,49 @@ impl Backend {
             },
         );
 
+        // Warn when a script file is not under any compiled directory (config.cpp files[]).
+        if let Some(ws) = workspace.read().unwrap().as_ref() {
+            if let Ok(url) = Url::parse(uri) {
+                if let Ok(path) = url.to_file_path() {
+                    let is_config =
+                        path.file_name().and_then(|n| n.to_str()) == Some("config.cpp");
+                    let is_script = path.extension().and_then(|e| e.to_str()) == Some("c");
+                    // Only flag the project's own files: dependency roots
+                    // (vanilla/Expansion) have no config.cpp in our workspace, so
+                    // every one of their files would otherwise be flagged.
+                    let in_dependency = ws
+                        .dependency_roots
+                        .iter()
+                        .any(|d| path.starts_with(d));
+                    if is_script && !is_config && !ws.is_compiled(&path) && !in_dependency {
+                        diagnostics.push(create_diagnostic(
+                            "File is not included in any module's files[] — excluded from compilation"
+                                .to_string(),
+                            DiagnosticSeverity::WARNING,
+                        ));
+                    }
+                }
+            }
+        }
+
         // Publish diagnostics
         let uri_parsed = Url::parse(uri).unwrap_or_else(|_| Url::parse("file:///unknown").unwrap());
-        self.client
+        client
             .publish_diagnostics(uri_parsed, diagnostics, None)
             .await;
     }
 
-    fn get_completions(&self, uri: &str, _position: Position) -> Vec<CompletionItem> {
+    fn get_completions(&self, uri: &str, position: Position) -> Vec<CompletionItem> {
+        // Member access: `obj.` → offer the members of `obj`'s type (not everything).
+        if let Some(doc) = self.documents.get(uri) {
+            let member_items = self.member_completions(&doc, position);
+            if !member_items.is_empty() {
+                return member_items;
+            }
+        }
+
         let mut items = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
 
         // Add keywords
         for keyword in &[
@@ -146,6 +319,7 @@ impl Backend {
             "break",
             "continue",
         ] {
+            seen.insert(keyword.to_string());
             items.push(CompletionItem {
                 label: keyword.to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
@@ -154,73 +328,205 @@ impl Backend {
             });
         }
 
-        // Add symbols from symbol table
-        if let Some(doc) = self.documents.get(uri)
-            && let Some(ref symbol_table) = doc.symbol_table
-        {
-            for symbol in symbol_table.get_all_symbols() {
-                let kind = match symbol.kind {
-                    SymbolKind::Class => CompletionItemKind::CLASS,
-                    SymbolKind::Enum => CompletionItemKind::ENUM,
-                    SymbolKind::Function | SymbolKind::Method => CompletionItemKind::FUNCTION,
-                    SymbolKind::Field => CompletionItemKind::FIELD,
-                    SymbolKind::Variable => CompletionItemKind::VARIABLE,
-                    SymbolKind::Parameter => CompletionItemKind::VARIABLE,
-                    SymbolKind::EnumVariant => CompletionItemKind::ENUM_MEMBER,
-                };
+        // Determine the enclosing class and its inheritance chain. Completion
+        // shows the current class's members first, then its ancestors', then
+        // globals — members of unrelated classes are excluded (strict namespace).
+        let chain: Vec<String> = {
+            let doc = self.documents.get(uri);
+            let class = doc
+                .as_ref()
+                .and_then(|d| d.program.as_ref())
+                .and_then(|p| enclosing_class(p, position));
+            match class {
+                Some(c) => match self.symbol_index.read().unwrap().as_ref() {
+                    Some(index) => ancestry_chain(&c, index),
+                    None => vec![c],
+                },
+                None => Vec::new(),
+            }
+        };
 
-                items.push(CompletionItem {
-                    label: symbol.name.clone(),
-                    kind: Some(kind),
-                    detail: symbol.type_ref.as_ref().map(|t| format!("{:?}", t)),
-                    ..Default::default()
-                });
+        // 1. Class members: the current class, then each ancestor, in order.
+        for class in &chain {
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+                for occs in index.by_name.values() {
+                    if let Some(occ) = occs.iter().find(|o| is_class_member_of(&o.symbol, class))
+                        && seen.insert(occ.symbol.name.clone())
+                    {
+                        items.push(symbol_to_completion(&occ.symbol));
+                    }
+                }
+            }
+            if let Some(doc) = self.documents.get(uri)
+                && let Some(st) = doc.symbol_table.as_ref()
+            {
+                for s in st.get_all_symbols() {
+                    if is_class_member_of(s, class) && seen.insert(s.name.clone()) {
+                        items.push(symbol_to_completion(s));
+                    }
+                }
+            }
+        }
+
+        // 2. Globals (classes, enums, typedefs, functions, globals, enum variants).
+        if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+            for (name, occs) in &index.by_name {
+                if let Some(occ) = occs.iter().find(|o| o.symbol.parent.is_none())
+                    && seen.insert(name.clone())
+                {
+                    items.push(symbol_to_completion(&occ.symbol));
+                }
+            }
+        }
+        if let Some(doc) = self.documents.get(uri)
+            && let Some(st) = doc.symbol_table.as_ref()
+        {
+            for s in st.get_all_symbols() {
+                if s.parent.is_none() && seen.insert(s.name.clone()) {
+                    items.push(symbol_to_completion(s));
+                }
+            }
+        }
+
+        // 3. Local variables/parameters of the enclosing method (span-scoped).
+        let doc = self.documents.get(uri);
+        let method_span = doc
+            .as_ref()
+            .and_then(|d| d.program.as_ref())
+            .and_then(|p| enclosing_method(p, position));
+        let symbol_table = doc.as_ref().and_then(|d| d.symbol_table.as_ref());
+        if let (Some(method_span), Some(st)) = (method_span, symbol_table) {
+            for s in st.get_all_symbols() {
+                if matches!(s.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                    && span_within(&method_span, &s.span)
+                    && seen.insert(s.name.clone())
+                {
+                    items.push(symbol_to_completion(s));
+                }
             }
         }
 
         items
     }
 
+    /// Member access completion: `obj.` resolves `obj`'s type and offers its
+    /// fields/methods (including inherited), instead of returning everything.
+    fn member_completions(&self, doc: &DocumentData, position: Position) -> Vec<CompletionItem> {
+        let Some(program) = doc.program.as_ref() else {
+            return Vec::new();
+        };
+        let Some((object_expr, partial)) = find_member_access_at(program, position) else {
+            return Vec::new();
+        };
+
+        let index_guard = self.symbol_index.read().unwrap();
+        let Some(index) = index_guard.as_ref() else {
+            return Vec::new();
+        };
+
+        // Resolve the object expression's type (handles `obj.method().` chains).
+        let enclosing = enclosing_class(program, position);
+        let Some(type_name) = resolve_expr_type(object_expr, doc, index, enclosing.as_deref()) else {
+            return Vec::new();
+        };
+
+        collect_members(&type_name, index, doc, partial)
+    }
+
     fn get_hover(&self, uri: &str, position: Position) -> Option<Hover> {
-        if let Some(doc) = self.documents.get(uri) {
-            // Find symbol name at position
-            if let Some(symbol_name) = find_symbol_at_position(&doc.text, position) {
-                // Look up symbol in symbol table
-                if let Some(ref symbol_table) = doc.symbol_table
-                    && let Some(symbol) = symbol_table.lookup(&symbol_name)
+        let doc = self.documents.get(uri)?;
+        let symbol_name = find_symbol_at_position(&doc.text, position)?;
+
+        let lenient = self.lenient_member_scope.load(Ordering::Relaxed);
+
+        // 1. Member access (`obj.name`): resolve via the OBJECT's type.
+        if let Some(program) = doc.program.as_ref()
+            && let Some((object_expr, member)) = find_member_access_at(program, position)
+        {
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+                let enclosing = enclosing_class(program, position);
+                let is_super = matches!(object_expr, Expression::Super(_));
+                if let Some(type_name) =
+                    resolve_expr_type(object_expr, &doc, index, enclosing.as_deref())
                 {
-                    let kind_str = match symbol.kind {
-                        crate::semantic::SymbolKind::Class => "class",
-                        crate::semantic::SymbolKind::Enum => "enum",
-                        crate::semantic::SymbolKind::Function => "function",
-                        crate::semantic::SymbolKind::Method => "method",
-                        crate::semantic::SymbolKind::Field => "field",
-                        crate::semantic::SymbolKind::Variable => "variable",
-                        crate::semantic::SymbolKind::Parameter => "parameter",
-                        crate::semantic::SymbolKind::EnumVariant => "enum variant",
-                    };
-
-                    let type_str = if let Some(ref type_ref) = symbol.type_ref {
-                        format!("{:?}", type_ref)
-                    } else {
-                        "unknown".to_string()
-                    };
-
-                    let value = format!(
-                        "```enforcescript\n({}) {}: {}\n```",
-                        kind_str, symbol.name, type_str
-                    );
-
-                    return Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value,
-                        }),
-                        range: Some(span_to_range(&symbol.span)),
-                    });
+                    // `super.Member` resolves to the origin/parent declaration, not
+                    // the modded override in the current file.
+                    if is_super {
+                        if let Some(occ) =
+                            find_member_in_hierarchy_skip_uri(&type_name, member, index, uri)
+                        {
+                            return Some(symbol_to_hover(&occ.symbol));
+                        }
+                        return None;
+                    }
+                    if let Some(symbol_table) = doc.symbol_table.as_ref()
+                        && let Some(symbol) = symbol_table.lookup_in_class(&type_name, member)
+                    {
+                        return Some(symbol_to_hover(symbol));
+                    }
+                    if let Some(occ) = find_member_in_hierarchy(&type_name, member, index) {
+                        return Some(symbol_to_hover(&occ.symbol));
+                    }
                 }
             }
+            return None;
         }
+
+        // 1.5. Cursor on a `modded class X` declaration name: hover the origin.
+        if let Some(program) = doc.program.as_ref()
+            && let Some(name) = class_name_at(program, position, &symbol_name)
+            && is_modded_class_doc(&name, &doc)
+        {
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+                let best = index
+                    .lookup(&name)
+                    .iter()
+                    .find(|m| m.symbol.kind == SymbolKind::Class && !is_modded(&m.symbol));
+                if let Some(m) = best {
+                    return Some(symbol_to_hover(&m.symbol));
+                }
+            }
+            return None;
+        }
+
+        // 2. Bare identifier: the enclosing class (and ancestors), then globals.
+        if let Some(class) = doc
+            .program
+            .as_ref()
+            .and_then(|p| enclosing_class(p, position))
+        {
+            if let Some(symbol_table) = doc.symbol_table.as_ref()
+                && let Some(symbol) = symbol_table.lookup_in_class(&class, &symbol_name)
+            {
+                return Some(symbol_to_hover(symbol));
+            }
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref()
+                && let Some(occ) = find_member_in_hierarchy(&class, &symbol_name, index)
+            {
+                return Some(symbol_to_hover(&occ.symbol));
+            }
+        }
+
+        // 3. Local symbol table.
+        if let Some(symbol_table) = doc.symbol_table.as_ref()
+            && let Some(symbol) = symbol_table.lookup(&symbol_name)
+        {
+            return Some(symbol_to_hover(symbol));
+        }
+
+        // 4. Cross-file: a global symbol; in lenient mode, also a same-named
+        //    member of another class.
+        if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+            let matches = index.lookup(&symbol_name);
+            let best = matches
+                .iter()
+                .find(|m| is_definition_kind(&m.symbol.kind))
+                .or_else(|| if lenient { matches.first() } else { None });
+            if let Some(m) = best {
+                return Some(symbol_to_hover(&m.symbol));
+            }
+        }
+
         None
     }
 
@@ -341,6 +647,127 @@ fn span_to_range(span: &crate::parser::Span) -> Range {
     )
 }
 
+/// Whether a symbol kind is a top-level "definition" (as opposed to a member).
+fn is_definition_kind(kind: &SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class | SymbolKind::Enum | SymbolKind::Function | SymbolKind::Variable
+    )
+}
+
+/// Convert a semantic symbol to a completion item.
+fn symbol_to_completion(symbol: &crate::semantic::Symbol) -> CompletionItem {
+    let kind = match symbol.kind {
+        SymbolKind::Class => CompletionItemKind::CLASS,
+        SymbolKind::Enum => CompletionItemKind::ENUM,
+        SymbolKind::Function | SymbolKind::Method => CompletionItemKind::FUNCTION,
+        SymbolKind::Field => CompletionItemKind::FIELD,
+        SymbolKind::Variable => CompletionItemKind::VARIABLE,
+        SymbolKind::Parameter => CompletionItemKind::VARIABLE,
+        SymbolKind::EnumVariant => CompletionItemKind::ENUM_MEMBER,
+    };
+    CompletionItem {
+        label: symbol.name.clone(),
+        kind: Some(kind),
+        detail: symbol.type_ref.as_ref().map(|t| format!("{:?}", t)),
+        ..Default::default()
+    }
+}
+
+/// Convert a semantic symbol to a hover.
+fn symbol_to_hover(symbol: &crate::semantic::Symbol) -> Hover {
+    let kind_str = match symbol.kind {
+        SymbolKind::Class => "class",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Function => "function",
+        SymbolKind::Method => "method",
+        SymbolKind::Field => "field",
+        SymbolKind::Variable => "variable",
+        SymbolKind::Parameter => "parameter",
+        SymbolKind::EnumVariant => "enum variant",
+    };
+    let type_str = match &symbol.type_ref {
+        Some(t) => format!("{:?}", t),
+        None => "unknown".to_string(),
+    };
+    // Show the literal value of a constant/field initializer (`= 50.0`) inline,
+    // so it's visible without jumping to the definition.
+    let value = match &symbol.value {
+        Some(v) => format!(
+            "```enforcescript\n({}) {}: {} = {}\n```",
+            kind_str, symbol.name, type_str, v
+        ),
+        None => format!(
+            "```enforcescript\n({}) {}: {}\n```",
+            kind_str, symbol.name, type_str
+        ),
+    };
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: Some(span_to_range(&symbol.span)),
+    }
+}
+
+/// Convert a lint issue to an LSP diagnostic.
+fn lint_issue_to_diagnostic(issue: LintIssue) -> Diagnostic {
+    let line = issue.line.saturating_sub(1) as u32;
+    Diagnostic {
+        range: Range::new(Position::new(line, 0), Position::new(line, 100)),
+        severity: Some(if issue.is_error {
+            DiagnosticSeverity::ERROR
+        } else {
+            DiagnosticSeverity::WARNING
+        }),
+        code: None,
+        code_description: None,
+        source: Some("enforce-script-lsp (lint)".to_string()),
+        message: issue.message,
+        related_information: None,
+        tags: None,
+        data: None,
+    }
+}
+
+/// Extract dependency roots (vanilla/Expansion dirs) from initializationOptions.
+fn extract_dependency_roots(opts: &Option<serde_json::Value>) -> Vec<std::path::PathBuf> {
+    opts.as_ref()
+        .and_then(|v| v.get("dependencyRoots"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str())
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract `lenientMemberScope` from initialization options (default `false`).
+fn extract_lenient_member_scope(opts: &Option<serde_json::Value>) -> bool {
+    opts.as_ref()
+        .and_then(|v| v.get("lenientMemberScope"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Extract `defaultDefines` (preprocessor defines applied to every file) from
+/// initialization options (default empty).
+fn extract_default_defines(opts: &Option<serde_json::Value>) -> Vec<String> {
+    opts.as_ref()
+        .and_then(|v| v.get("defaultDefines"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Extract line number from error message (format: "... at line N")
 fn extract_line_from_error(message: &str) -> Option<usize> {
     if let Some(idx) = message.rfind("at line ") {
@@ -379,23 +806,21 @@ fn create_diagnostic(message: String, severity: DiagnosticSeverity) -> Diagnosti
 
 /// Find symbol name at given position in text
 fn find_symbol_at_position(text: &str, position: Position) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let line_idx = position.line as usize;
-    let col_idx = position.character as usize;
+    let line = text.lines().nth(position.line as usize)?;
 
-    if line_idx >= lines.len() {
-        return None;
-    }
-
-    let line = lines[line_idx];
-    if col_idx >= line.len() {
+    // Work in character space, not byte space: a byte-index slice into a line
+    // containing multi-byte UTF-8 (e.g. Cyrillic comments) would panic on a
+    // non-char boundary.
+    let chars: Vec<char> = line.chars().collect();
+    let col = position.character as usize;
+    if col >= chars.len() {
         return None;
     }
 
     // Find the start of the identifier
-    let mut start = col_idx;
+    let mut start = col;
     while start > 0 {
-        let ch = line.chars().nth(start - 1)?;
+        let ch = chars[start - 1];
         if ch.is_alphanumeric() || ch == '_' {
             start -= 1;
         } else {
@@ -404,9 +829,9 @@ fn find_symbol_at_position(text: &str, position: Position) -> Option<String> {
     }
 
     // Find the end of the identifier
-    let mut end = col_idx;
-    while end < line.len() {
-        let ch = line.chars().nth(end)?;
+    let mut end = col;
+    while end < chars.len() {
+        let ch = chars[end];
         if ch.is_alphanumeric() || ch == '_' {
             end += 1;
         } else {
@@ -415,15 +840,618 @@ fn find_symbol_at_position(text: &str, position: Position) -> Option<String> {
     }
 
     if start < end {
-        Some(line[start..end].to_string())
+        Some(chars[start..end].iter().collect())
     } else {
         None
     }
 }
 
+/// Detect a member-access completion context `obj.<partial>` at `position`.
+/// Returns `(object, partial_member)` where `object` is the trailing identifier
+/// before the last `.` and `partial_member` is the (possibly empty) prefix after it.
+fn find_member_context(text: &str, position: Position) -> Option<(String, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let line = *lines.get(position.line as usize)?;
+    let col = position.character as usize;
+    let prefix: String = line.chars().take(col).collect();
+
+    let dot = prefix.rfind('.')?;
+    let partial = prefix[dot + 1..].trim().to_string();
+
+    // The object is the trailing word (identifier / this / super) before the dot.
+    let before = prefix[..dot].trim_end();
+    let obj_start = before
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let object = &before[obj_start..];
+    if object.is_empty() {
+        return None;
+    }
+
+    // The partial must be empty or a valid identifier prefix.
+    if !partial.is_empty() && !partial.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    Some((object.to_string(), partial))
+}
+
+/// Find the class whose span contains `position` (for `this`/`super` resolution).
+/// Whether the 1-based `(line, column)` position lies within `span` (inclusive).
+fn span_contains(span: &Span, line: usize, column: usize) -> bool {
+    let after_start = line > span.start.line || (line == span.start.line && column >= span.start.column);
+    let before_end = line < span.end.line || (line == span.end.line && column <= span.end.column);
+    after_start && before_end
+}
+
+/// Whether `inner` lies entirely within `outer` (line-based; parser spans are 1-based).
+fn span_within(outer: &Span, inner: &Span) -> bool {
+    inner.start.line >= outer.start.line && inner.end.line <= outer.end.line
+}
+
+/// Find the (0-based line, 0-based char column) of `name` within `span`, by
+/// searching the lines of `text` covered by the span for the first occurrence.
+fn find_name_position(text: &str, span: &Span, name: &str) -> Option<(u32, u32)> {
+    let lines: Vec<&str> = text.lines().collect();
+    // Parser spans use 1-based lines; convert to 0-based.
+    let start = span.start.line.saturating_sub(1);
+    let end = span.end.line.min(lines.len());
+    for idx in start..end {
+        let line = lines[idx];
+        if let Some(byte_col) = line.find(name) {
+            let col = line[..byte_col].chars().count() as u32;
+            return Some((idx as u32, col));
+        }
+    }
+    None
+}
+
+fn enclosing_class(program: &Program, position: Position) -> Option<String> {
+    // LSP lines/characters are 0-based; parser spans are 1-based.
+    let line = position.line as usize + 1;
+    let column = position.character as usize + 1;
+    for decl in &program.declarations {
+        if let Declaration::Class(class) = decl {
+            if span_contains(&class.span, line, column) {
+                return Some(class.name.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Find the method (or module-level function) whose span contains `position`, so
+/// local variables can be scoped to their enclosing method.
+fn enclosing_method(program: &Program, position: Position) -> Option<Span> {
+    let line = position.line as usize + 1;
+    let column = position.character as usize + 1;
+    for decl in &program.declarations {
+        match decl {
+            Declaration::Class(class) => {
+                for method in &class.methods {
+                    if span_contains(&method.span, line, column) {
+                        return Some(method.span.clone());
+                    }
+                }
+            }
+            Declaration::Function(method) => {
+                if span_contains(&method.span, line, column) {
+                    return Some(method.span.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Find the `MemberAccess` expression under `position`, returning its object
+/// expression and member name. Handles chained calls like `obj.method().member`
+/// (the object is the full sub-expression, not just a trailing identifier).
+fn find_member_access_at<'a>(
+    program: &'a Program,
+    position: Position,
+) -> Option<(&'a Expression, &'a str)> {
+    let line = position.line as usize + 1;
+    let column = position.character as usize + 1;
+    let mut found = None;
+    for decl in &program.declarations {
+        visit_decl_member(decl, line, column, &mut found);
+    }
+    found
+}
+
+fn visit_decl_member<'a>(
+    decl: &'a Declaration,
+    line: usize,
+    column: usize,
+    found: &mut Option<(&'a Expression, &'a str)>,
+) {
+    match decl {
+        Declaration::Class(class) => {
+            for method in &class.methods {
+                if let Some(body) = &method.body {
+                    visit_stmt_member(body, line, column, found);
+                }
+            }
+        }
+        Declaration::Function(method) => {
+            if let Some(body) = &method.body {
+                visit_stmt_member(body, line, column, found);
+            }
+        }
+        Declaration::Variable(field) => {
+            if let Some(init) = &field.initializer {
+                visit_expr_member(init, line, column, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn visit_stmt_member<'a>(
+    stmt: &'a Statement,
+    line: usize,
+    column: usize,
+    found: &mut Option<(&'a Expression, &'a str)>,
+) {
+    match stmt {
+        Statement::VariableDeclaration { declarators, .. } => {
+            for (_, init) in declarators {
+                if let Some(e) = init {
+                    visit_expr_member(e, line, column, found);
+                }
+            }
+        }
+        Statement::Expression { expression, .. } => visit_expr_member(expression, line, column, found),
+        Statement::Block { statements, .. } => {
+            for s in statements {
+                visit_stmt_member(s, line, column, found);
+            }
+        }
+        Statement::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            visit_expr_member(condition, line, column, found);
+            visit_stmt_member(then_branch, line, column, found);
+            if let Some(e) = else_branch {
+                visit_stmt_member(e, line, column, found);
+            }
+        }
+        Statement::Switch {
+            expression, cases, ..
+        } => {
+            visit_expr_member(expression, line, column, found);
+            for (case_expr, case_stmts) in cases {
+                if let Some(e) = case_expr {
+                    visit_expr_member(e, line, column, found);
+                }
+                for s in case_stmts {
+                    visit_stmt_member(s, line, column, found);
+                }
+            }
+        }
+        Statement::For {
+            initializer,
+            condition,
+            increment,
+            body,
+            ..
+        } => {
+            if let Some(i) = initializer {
+                visit_stmt_member(i, line, column, found);
+            }
+            if let Some(c) = condition {
+                visit_expr_member(c, line, column, found);
+            }
+            if let Some(inc) = increment {
+                visit_expr_member(inc, line, column, found);
+            }
+            visit_stmt_member(body, line, column, found);
+        }
+        Statement::Foreach { iterable, body, .. } => {
+            visit_expr_member(iterable, line, column, found);
+            visit_stmt_member(body, line, column, found);
+        }
+        Statement::While { condition, body, .. } => {
+            visit_expr_member(condition, line, column, found);
+            visit_stmt_member(body, line, column, found);
+        }
+        Statement::Return { value, .. } => {
+            if let Some(e) = value {
+                visit_expr_member(e, line, column, found);
+            }
+        }
+        Statement::Delete { expression, .. } => visit_expr_member(expression, line, column, found),
+        Statement::Break(_) | Statement::Continue(_) => {}
+    }
+}
+
+fn visit_expr_member<'a>(
+    expr: &'a Expression,
+    line: usize,
+    column: usize,
+    found: &mut Option<(&'a Expression, &'a str)>,
+) {
+    match expr {
+        Expression::MemberAccess {
+            object, member, span, ..
+        } => {
+            // The cursor must be on the member (the trailing identifier), not the
+            // object; a deeper MemberAccess whose member is under the cursor
+            // overrides a shallower one.
+            let member_start_col = span.end.column.saturating_sub(member.chars().count());
+            if span_contains(span, line, column)
+                && line == span.end.line
+                && column >= member_start_col
+            {
+                *found = Some((object, member));
+            }
+            visit_expr_member(object, line, column, found);
+        }
+        Expression::Call {
+            callee, arguments, ..
+        } => {
+            visit_expr_member(callee, line, column, found);
+            for a in arguments {
+                visit_expr_member(a, line, column, found);
+            }
+        }
+        Expression::Binary { left, right, .. } => {
+            visit_expr_member(left, line, column, found);
+            visit_expr_member(right, line, column, found);
+        }
+        Expression::Unary { operand, .. } => visit_expr_member(operand, line, column, found),
+        Expression::Index { object, index, .. } => {
+            visit_expr_member(object, line, column, found);
+            visit_expr_member(index, line, column, found);
+        }
+        Expression::ArrayLiteral { elements, .. } => {
+            for e in elements {
+                visit_expr_member(e, line, column, found);
+            }
+        }
+        Expression::New { arguments, .. } => {
+            for a in arguments {
+                visit_expr_member(a, line, column, found);
+            }
+        }
+        Expression::Cast { expression, .. } => visit_expr_member(expression, line, column, found),
+        Expression::Ternary {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            visit_expr_member(condition, line, column, found);
+            visit_expr_member(then_expr, line, column, found);
+            visit_expr_member(else_expr, line, column, found);
+        }
+        _ => {}
+    }
+}
+
+/// Whether `name` is a known class type (has a parent entry or a Class symbol).
+fn is_class_type(name: &str, index: &SymbolIndex) -> bool {
+    if index.class_parents.contains_key(name) {
+        return true;
+    }
+    index
+        .lookup(name)
+        .iter()
+        .any(|occ| occ.symbol.kind == SymbolKind::Class)
+}
+
+/// Whether `name` is a known enum type (has an Enum symbol).
+fn is_enum_type(name: &str, index: &SymbolIndex) -> bool {
+    index
+        .lookup(name)
+        .iter()
+        .any(|occ| occ.symbol.kind == SymbolKind::Enum)
+}
+
+/// Resolve the type name of a member-access object (a local/field/parameter with
+/// a class type, or a class/enum name used for static access).
+fn resolve_type_name(
+    object: &str,
+    doc: &DocumentData,
+    index: &SymbolIndex,
+    enclosing: Option<&str>,
+) -> Option<String> {
+    // 1. Object is a field/variable/parameter → its declared type.
+    if let Some(st) = &doc.symbol_table {
+        for s in st.get_all_symbols() {
+            if s.name == object
+                && matches!(
+                    s.kind,
+                    SymbolKind::Field | SymbolKind::Variable | SymbolKind::Parameter
+                )
+                && let Some(t) = &s.type_ref
+            {
+                let name = type_ref_base_name(t);
+                if is_class_type(&name, index) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+
+    // 2. Object is a class or enum name (static member access).
+    if is_class_type(object, index) || is_enum_type(object, index) {
+        return Some(object.to_string());
+    }
+
+    // 3. Object is a field/variable/parameter inherited from an ancestor class
+    //    (declared in another file, so absent from this document's symbol table).
+    if let Some(class) = enclosing {
+        for ancestor in ancestry_chain(class, index) {
+            if let Some(occ) = index.lookup(object).iter().find(|occ| {
+                matches!(
+                    occ.symbol.kind,
+                    SymbolKind::Field | SymbolKind::Variable | SymbolKind::Parameter
+                ) && occ.symbol.parent.as_deref() == Some(ancestor.as_str())
+            }) && let Some(t) = &occ.symbol.type_ref
+            {
+                let name = type_ref_base_name(t);
+                if is_class_type(&name, index) || is_enum_type(&name, index) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve the type name of an arbitrary expression (identifier, member access,
+/// call, cast, `this`/`super`). Powers `obj.method().member` by resolving the
+/// object's type recursively through method calls and member accesses.
+fn resolve_expr_type(
+    expr: &Expression,
+    doc: &DocumentData,
+    index: &SymbolIndex,
+    enclosing: Option<&str>,
+) -> Option<String> {
+    match expr {
+        Expression::Identifier(name, _) => resolve_type_name(name, doc, index, enclosing),
+        Expression::This(_) => enclosing.map(str::to_string),
+        Expression::Super(_) => {
+            // In a `modded class X`, `super` refers to the origin `class X` (which
+            // the modded declaration merges with); in a plain class it's the parent.
+            if enclosing.is_some_and(|c| is_modded_class_doc(c, doc)) {
+                enclosing.map(str::to_string)
+            } else {
+                enclosing.and_then(|c| index.class_parents.get(c).cloned().flatten())
+            }
+        }
+        Expression::MemberAccess { object, member, .. } => {
+            let obj_type = resolve_expr_type(object, doc, index, enclosing)?;
+            let occ = find_member_in_hierarchy(&obj_type, member, index)?;
+            occ.symbol.type_ref.as_ref().map(type_ref_base_name)
+        }
+        Expression::Call { callee, .. } => resolve_expr_type(callee, doc, index, enclosing),
+        Expression::Cast { type_ref, .. } | Expression::New { type_ref, .. } => {
+            Some(type_ref_base_name(type_ref))
+        }
+        Expression::TypeRef(t, _) => Some(type_ref_base_name(t)),
+        _ => None,
+    }
+}
+
+/// Build the inheritance chain `[class, parent, grandparent, …]`, guarding
+/// against cycles (via a step cap).
+fn ancestry_chain(class: &str, index: &SymbolIndex) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = Some(class.to_string());
+    let mut guard = 0;
+    while let Some(c) = current {
+        chain.push(c.clone());
+        current = index.class_parents.get(&c).cloned().flatten();
+        guard += 1;
+        if guard > 100 {
+            break;
+        }
+    }
+    chain
+}
+
+/// Whether `symbol` is a field/method declared directly in `class` (as opposed
+/// to a global, a local variable, or a member of another class).
+fn is_class_member_of(symbol: &Symbol, class: &str) -> bool {
+    matches!(symbol.kind, SymbolKind::Field | SymbolKind::Method)
+        && symbol.parent.as_deref() == Some(class)
+}
+
+/// Whether a class symbol is a `modded class` declaration (CF/Expansion-style
+/// class extension that merges with its origin class of the same name).
+fn is_modded(symbol: &Symbol) -> bool {
+    symbol.modifiers.iter().any(|m| m == "modded")
+}
+
+/// Whether the current document declares `modded class <name>`.
+fn is_modded_class_doc(name: &str, doc: &DocumentData) -> bool {
+    doc.program.as_ref().is_some_and(|p| {
+        p.declarations.iter().any(|d| {
+            matches!(
+                d,
+                Declaration::Class(c)
+                    if c.name == name && c.modifiers.iter().any(|m| m == "modded")
+            )
+        })
+    })
+}
+
+/// If `position` is on the name of a class declaration (the `class`/`modded
+/// class` keyword line) and `symbol_name` equals that class's name, return the
+/// class name. Lets goto-def/hover on `modded class X` resolve to the origin
+/// `class X` instead of the same-named constructor.
+fn class_name_at(program: &Program, position: Position, symbol_name: &str) -> Option<String> {
+    let line = position.line as usize + 1;
+    let column = position.character as usize + 1;
+    for decl in &program.declarations {
+        if let Declaration::Class(class) = decl {
+            if class.span.start.line == line
+                && class.name == symbol_name
+                && span_contains(&class.span, line, column)
+            {
+                return Some(class.name.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Build a completion item for a member. Enum variants are indexed with a
+/// dotted `Enum.Variant` name; strip the enum prefix so the completion offers
+/// the bare `Variant`.
+fn member_completion_item(symbol: &Symbol) -> CompletionItem {
+    let mut item = symbol_to_completion(symbol);
+    if symbol.kind == SymbolKind::EnumVariant
+        && let Some(parent) = &symbol.parent
+    {
+        let prefix = format!("{}.", parent);
+        item.label = symbol
+            .name
+            .strip_prefix(&prefix)
+            .unwrap_or(&symbol.name)
+            .to_string();
+    }
+    item
+}
+
+/// Collect the members of `type_name` (walking the inheritance chain) as
+/// completion items, filtered by `partial`. Sources: the cross-file index
+/// (for inherited/other-file members) and the current document's symbol table
+/// (for members being edited right now).
+fn collect_members(
+    type_name: &str,
+    index: &SymbolIndex,
+    doc: &DocumentData,
+    partial: &str,
+) -> Vec<CompletionItem> {
+    // Build the ancestry chain (type + all ancestors), guarding against cycles.
+    let chain = ancestry_chain(type_name, index);
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut items = Vec::new();
+
+    // 1. From the cross-file index.
+    for occs in index.by_name.values() {
+        for occ in occs {
+            if matches!(
+                occ.symbol.kind,
+                SymbolKind::Field | SymbolKind::Method | SymbolKind::EnumVariant
+            ) && let Some(parent) = &occ.symbol.parent
+                && chain.contains(parent)
+                && seen.insert(occ.symbol.name.clone())
+            {
+                items.push(member_completion_item(&occ.symbol));
+            }
+        }
+    }
+
+    // 2. From the current document (fresh members, in case the file is mid-edit).
+    if let Some(st) = &doc.symbol_table {
+        for s in st.get_all_symbols() {
+            if matches!(
+                s.kind,
+                SymbolKind::Field | SymbolKind::Method | SymbolKind::EnumVariant
+            ) && let Some(parent) = &s.parent
+                && chain.contains(parent)
+                && seen.insert(s.name.clone())
+            {
+                items.push(member_completion_item(s));
+            }
+        }
+    }
+
+    // Filter by the partial prefix.
+    if !partial.is_empty() {
+        items.retain(|i| i.label.starts_with(partial));
+    }
+
+    items
+}
+
+/// Find the member `name` declared in `class` or any of its ancestors (walking
+/// `class_parents`). Used to resolve a field/method to its definition, including
+/// inherited members that live in another file.
+fn find_member_in_hierarchy<'a>(
+    class: &str,
+    name: &str,
+    index: &'a SymbolIndex,
+) -> Option<&'a IndexedSymbol> {
+    let chain = ancestry_chain(class, index);
+    index
+        .lookup(name)
+        .iter()
+        .find(|occ| occ.symbol.parent.as_ref().is_some_and(|p| chain.contains(p)))
+        .or_else(|| index.lookup(&format!("{}.{}", class, name)).first())
+}
+
+/// Whether two URIs refer to the same file, ignoring normalization differences
+/// (e.g. `file:///a/b` vs `file:///a/b/` or percent-encoding). Raw-string equal
+/// is the fast path; otherwise compare resolved filesystem paths.
+fn same_file(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (Url::parse(a), Url::parse(b)) {
+        (Ok(ua), Ok(ub)) => match (ua.to_file_path(), ub.to_file_path()) {
+            (Ok(pa), Ok(pb)) => pa == pb,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Like `find_member_in_hierarchy`, but skips occurrences from `skip_uri`. Used
+/// for `super.Member`: in a `modded class X`, `super` resolves to the origin
+/// `class X`, so the member must be found in the origin (or an ancestor), not
+/// the modded override living in the current file.
+fn find_member_in_hierarchy_skip_uri<'a>(
+    class: &str,
+    name: &str,
+    index: &'a SymbolIndex,
+    skip_uri: &str,
+) -> Option<&'a IndexedSymbol> {
+    let chain = ancestry_chain(class, index);
+    index
+        .lookup(name)
+        .iter()
+        .find(|occ| {
+            !same_file(&occ.uri, skip_uri)
+                && occ.symbol.parent.as_ref().is_some_and(|p| chain.contains(p))
+        })
+        .or_else(|| {
+            index
+                .lookup(&format!("{}.{}", class, name))
+                .iter()
+                .find(|occ| !same_file(&occ.uri, skip_uri))
+        })
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Discover config.cpp files and build the workspace model from rootUri.
+        if let Some(uri) = params.root_uri {
+            if let Ok(root) = uri.to_file_path() {
+                let dependency_roots = extract_dependency_roots(&params.initialization_options);
+                let default_defines = extract_default_defines(&params.initialization_options);
+                let workspace = Workspace::build(&root, dependency_roots, default_defines);
+                *self.workspace.write().unwrap() = Some(workspace);
+            }
+        }
+        self.lenient_member_scope.store(
+            extract_lenient_member_scope(&params.initialization_options),
+            Ordering::Relaxed,
+        );
+
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "enforce-script-lsp".to_string(),
@@ -456,14 +1484,65 @@ impl LanguageServer for Backend {
                 rename_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                        work_done_progress_options: Default::default(),
+                        legend: SemanticTokensLegend {
+                            token_types: vec![
+                                SemanticTokenType::CLASS,
+                                SemanticTokenType::ENUM,
+                                SemanticTokenType::FUNCTION,
+                                SemanticTokenType::METHOD,
+                                SemanticTokenType::PROPERTY,
+                                SemanticTokenType::VARIABLE,
+                                SemanticTokenType::PARAMETER,
+                                SemanticTokenType::ENUM_MEMBER,
+                            ],
+                            token_modifiers: vec![SemanticTokenModifier::DECLARATION],
+                        },
+                        range: Some(false),
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                    }),
+                ),
                 ..Default::default()
             },
         })
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        // Build the cross-file symbol index on a blocking thread so the server
+        // stays responsive during the (cold) ~40s vanilla-pack build.
+        let ws = self.workspace.clone();
+        let index = tokio::task::spawn_blocking(move || {
+            let ws = ws.read().unwrap();
+            ws.as_ref().map(SymbolIndex::build)
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let Some(index) = index else {
+            return;
+        };
+        let n = index.by_name.len();
+        *self.symbol_index.write().unwrap() = Some(index);
+
+        // Re-analyze documents opened while the index was building, so their
+        // diagnostics get cross-file resolution (they were analyzed without it).
+        let docs: Vec<(String, String)> = self
+            .documents
+            .iter()
+            .map(|d| (d.key().clone(), d.value().text.clone()))
+            .collect();
+        for (uri, text) in docs {
+            self.analyze_document(&uri, &text).await;
+        }
+
         self.client
-            .log_message(MessageType::INFO, "Enforce Script LSP initialized")
+            .log_message(
+                MessageType::INFO,
+                format!("Enforce Script LSP initialized ({} indexed symbols)", n),
+            )
             .await;
     }
 
@@ -475,12 +1554,17 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         let text = params.text_document.text;
         self.analyze_document(&uri, &text).await;
+        // The file's text may differ from the index (edited on disk since start).
+        self.dirty.insert(uri, text);
+        self.schedule_reindex();
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         if let Some(change) = params.content_changes.into_iter().next() {
             self.analyze_document(&uri, &change.text).await;
+            self.dirty.insert(uri, change.text);
+            self.schedule_reindex();
         }
     }
 
@@ -488,13 +1572,68 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         self.documents.remove(&uri);
     }
-
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri.to_string();
         let position = params.text_document_position.position;
 
         let items = self.get_completions(&uri, position);
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri.to_string();
+        let Some(doc) = self.documents.get(&uri) else {
+            return Ok(None);
+        };
+        let Some(st) = doc.symbol_table.as_ref() else {
+            return Ok(None);
+        };
+
+        // Map each symbol's name to a (line, col, len, token_type) tuple.
+        let mut raw: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for s in st.get_all_symbols() {
+            let type_index = match s.kind {
+                SymbolKind::Class => 0,
+                SymbolKind::Enum => 1,
+                SymbolKind::Function => 2,
+                SymbolKind::Method => 3,
+                SymbolKind::Field => 4,
+                SymbolKind::Variable => 5,
+                SymbolKind::Parameter => 6,
+                SymbolKind::EnumVariant => 7,
+            };
+            let Some((line, col)) = find_name_position(&doc.text, &s.span, &s.name) else {
+                continue;
+            };
+            let len = s.name.chars().count() as u32;
+            raw.push((line, col, len, type_index));
+        }
+
+        // Delta-encode (sorted by position).
+        raw.sort_by_key(|&(l, c, _, _)| (l, c));
+        let mut data = Vec::with_capacity(raw.len());
+        let (mut prev_line, mut prev_col) = (0u32, 0u32);
+        for (line, col, len, type_index) in raw {
+            let delta_line = line - prev_line;
+            let delta_start = if delta_line == 0 { col - prev_col } else { col };
+            data.push(SemanticToken {
+                delta_line,
+                delta_start,
+                length: len,
+                token_type: type_index,
+                token_modifiers_bitset: 1, // declaration
+            });
+            prev_line = line;
+            prev_col = col;
+        }
+
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -556,19 +1695,137 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
         let uri_str = uri.to_string();
 
-        if let Some(doc) = self.documents.get(&uri_str) {
-            // Find symbol name at position
-            if let Some(symbol_name) = find_symbol_at_position(&doc.text, position) {
-                // Look up symbol in symbol table
-                if let Some(ref symbol_table) = doc.symbol_table
-                    && let Some(symbol) = symbol_table.lookup(&symbol_name)
+        let Some(doc) = self.documents.get(&uri_str) else {
+            return Ok(None);
+        };
+        let Some(symbol_name) = find_symbol_at_position(&doc.text, position) else {
+            return Ok(None);
+        };
+
+        let lenient = self.lenient_member_scope.load(Ordering::Relaxed);
+
+        // 1. Member access (`obj.name`): resolve the member via the OBJECT's type
+        //    (not the enclosing class), including inherited members.
+        if let Some(program) = doc.program.as_ref()
+            && let Some((object_expr, member)) = find_member_access_at(program, position)
+        {
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+                let enclosing = enclosing_class(program, position);
+                let is_super = matches!(object_expr, Expression::Super(_));
+                if let Some(type_name) =
+                    resolve_expr_type(object_expr, &doc, index, enclosing.as_deref())
                 {
-                    let location = Location {
-                        uri,
-                        range: span_to_range(&symbol.span),
-                    };
-                    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                    // `super.Member` resolves to the origin/parent declaration, not
+                    // the modded override living in the current file.
+                    if is_super {
+                        if let Some(occ) =
+                            find_member_in_hierarchy_skip_uri(&type_name, member, index, &uri_str)
+                            && let Ok(url) = Url::parse(&occ.uri)
+                        {
+                            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                                uri: url,
+                                range: span_to_range(&occ.symbol.span),
+                            })));
+                        }
+                        return Ok(None);
+                    }
+                    if let Some(symbol_table) = doc.symbol_table.as_ref()
+                        && let Some(symbol) = symbol_table.lookup_in_class(&type_name, member)
+                    {
+                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: uri.clone(),
+                            range: span_to_range(&symbol.span),
+                        })));
+                    }
+                    if let Some(occ) = find_member_in_hierarchy(&type_name, member, index)
+                        && let Ok(url) = Url::parse(&occ.uri)
+                    {
+                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: url,
+                            range: span_to_range(&occ.symbol.span),
+                        })));
+                    }
                 }
+            }
+            // A member access we couldn't resolve — don't fall through to a
+            // same-named global or unrelated member.
+            return Ok(None);
+        }
+
+        // 1.5. Cursor on a `modded class X` declaration name: resolve to the
+        //      origin (non-modded) `class X` instead of the same-named constructor.
+        if let Some(program) = doc.program.as_ref()
+            && let Some(name) = class_name_at(program, position, &symbol_name)
+            && is_modded_class_doc(&name, &doc)
+        {
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+                let best = index
+                    .lookup(&name)
+                    .iter()
+                    .find(|m| m.symbol.kind == SymbolKind::Class && !is_modded(&m.symbol));
+                if let Some(m) = best
+                    && let Ok(url) = Url::parse(&m.uri)
+                {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: url,
+                        range: span_to_range(&m.symbol.span),
+                    })));
+                }
+            }
+            // No origin indexed yet — don't fall through to the constructor.
+            return Ok(None);
+        }
+
+        // 2. Bare identifier: the enclosing class (and ancestors), then globals.
+        if let Some(class) = doc
+            .program
+            .as_ref()
+            .and_then(|p| enclosing_class(p, position))
+        {
+            if let Some(symbol_table) = doc.symbol_table.as_ref()
+                && let Some(symbol) = symbol_table.lookup_in_class(&class, &symbol_name)
+            {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: uri.clone(),
+                    range: span_to_range(&symbol.span),
+                })));
+            }
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref()
+                && let Some(occ) = find_member_in_hierarchy(&class, &symbol_name, index)
+                && let Ok(url) = Url::parse(&occ.uri)
+            {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: url,
+                    range: span_to_range(&occ.symbol.span),
+                })));
+            }
+        }
+
+        // 3. Local: current document's symbol table (globals).
+        if let Some(symbol_table) = doc.symbol_table.as_ref()
+            && let Some(symbol) = symbol_table.lookup(&symbol_name)
+        {
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: span_to_range(&symbol.span),
+            })));
+        }
+
+        // 4. Cross-file: a global symbol (class/enum/function/variable). Only in
+        //    lenient mode do we also fall back to a same-named member of another class.
+        if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+            let matches = index.lookup(&symbol_name);
+            let best = matches
+                .iter()
+                .find(|m| is_definition_kind(&m.symbol.kind))
+                .or_else(|| if lenient { matches.first() } else { None });
+            if let Some(m) = best
+                && let Ok(url) = Url::parse(&m.uri)
+            {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: url,
+                    range: span_to_range(&m.symbol.span),
+                })));
             }
         }
 
@@ -580,32 +1837,87 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         let uri_str = uri.to_string();
 
-        if let Some(doc) = self.documents.get(&uri_str) {
-            // Find symbol name at position
-            if let Some(symbol_name) = find_symbol_at_position(&doc.text, position) {
-                // For now, just return all symbols with the same name
-                // A more sophisticated implementation would track actual usage
-                if let Some(ref symbol_table) = doc.symbol_table {
-                    let mut locations = Vec::new();
+        let Some(doc) = self.documents.get(&uri_str) else {
+            return Ok(None);
+        };
+        let Some(symbol_name) = find_symbol_at_position(&doc.text, position) else {
+            return Ok(None);
+        };
 
-                    // Get all symbols with this name
-                    for symbol in symbol_table.get_all_symbols() {
-                        if symbol.name == symbol_name {
-                            locations.push(Location {
-                                uri: uri.clone(),
-                                range: span_to_range(&symbol.span),
-                            });
-                        }
-                    }
+        // Role: cursor on the member after `.` → MemberMember; otherwise bare.
+        let (role, object_name) = match find_member_context(&doc.text, position) {
+            Some((object, _)) if object != symbol_name => {
+                (UsageRole::MemberMember, Some(object))
+            }
+            _ => (UsageRole::Bare, None),
+        };
 
-                    if !locations.is_empty() {
-                        return Ok(Some(locations));
-                    }
+        // Local variable/parameter types (for member-access object resolution).
+        let mut local_types: HashMap<String, String> = HashMap::new();
+        if let Some(st) = doc.symbol_table.as_ref() {
+            for s in st.get_all_symbols() {
+                if matches!(s.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                    && let Some(t) = &s.type_ref
+                {
+                    local_types.insert(s.name.clone(), type_ref_base_name(t));
                 }
             }
         }
 
-        Ok(None)
+        let enclosing_class = doc
+            .program
+            .as_ref()
+            .and_then(|p| enclosing_class(p, position));
+        let enclosing_method_line = doc
+            .program
+            .as_ref()
+            .and_then(|p| enclosing_method(p, position))
+            .map(|s| s.start.line);
+
+        let usage = IndexedUsage {
+            name: symbol_name.clone(),
+            uri: uri_str.clone(),
+            span: Span::new(
+                crate::parser::Position::new(0, 0, 0),
+                crate::parser::Position::new(0, 0, 0),
+            ),
+            role,
+            object_name,
+            enclosing_class,
+            enclosing_method_line,
+        };
+
+        // Ensure identities are up to date (a file may have changed since the
+        // index was last resolved).
+        {
+            let mut guard = self.symbol_index.write().unwrap();
+            if let Some(index) = guard.as_mut() {
+                index.ensure_identities();
+            }
+        }
+
+        let index_guard = self.symbol_index.read().unwrap();
+        let Some(index) = index_guard.as_ref() else {
+            return Ok(None);
+        };
+        let Some(identity) = index.resolve_usage_identity(&usage, &local_types) else {
+            return Ok(None);
+        };
+        let Some(occurrences) = index.by_identity.get(&identity) else {
+            return Ok(None);
+        };
+
+        let locations: Vec<Location> = occurrences
+            .iter()
+            .filter_map(|(u, span)| {
+                Some(Location {
+                    uri: Url::parse(u).ok()?,
+                    range: span_to_range(span),
+                })
+            })
+            .collect();
+
+        Ok(Some(locations))
     }
 
     async fn document_symbol(
@@ -689,4 +2001,173 @@ pub async fn start_server() {
 
     let (service, socket) = LspService::new(Backend::new);
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pos(line: u32, character: u32) -> Position {
+        Position::new(line, character)
+    }
+
+    #[test]
+    fn test_find_member_context_object_dot() {
+        // "obj." — cursor right after the dot.
+        let (object, partial) = find_member_context("obj.", pos(0, 4)).unwrap();
+        assert_eq!(object, "obj");
+        assert_eq!(partial, "");
+    }
+
+    #[test]
+    fn test_find_member_context_partial_member() {
+        // "obj.foo" — cursor after "foo".
+        let (object, partial) = find_member_context("obj.foo", pos(0, 7)).unwrap();
+        assert_eq!(object, "obj");
+        assert_eq!(partial, "foo");
+    }
+
+    #[test]
+    fn test_find_member_context_this() {
+        let (object, partial) = find_member_context("this.", pos(0, 5)).unwrap();
+        assert_eq!(object, "this");
+        assert_eq!(partial, "");
+    }
+
+    #[test]
+    fn test_find_member_context_no_dot() {
+        assert!(find_member_context("player", pos(0, 6)).is_none());
+    }
+
+    #[test]
+    fn test_find_member_context_leading_code() {
+        // "void F() { player." — the object is the identifier right before the dot.
+        let text = "void F() { player.";
+        let col = text.len() as u32; // cursor at end, right after '.'
+        let (object, partial) = find_member_context(text, pos(0, col)).unwrap();
+        assert_eq!(object, "player");
+        assert_eq!(partial, "");
+    }
+
+    #[test]
+    fn test_enclosing_class() {
+        let code = "class A {\n  void F() { this.X(); }\n}\nclass B {\n  void G() {}\n}";
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+        // Line 1 (0-based) is inside class A.
+        let name = enclosing_class(&program, pos(1, 10)).unwrap();
+        assert_eq!(name, "A");
+        // Line 4 is inside class B.
+        let name = enclosing_class(&program, pos(4, 10)).unwrap();
+        assert_eq!(name, "B");
+    }
+
+    #[test]
+    fn test_enclosing_method() {
+        let code = "class A {\n  void F() {\n    int x;\n  }\n  void G() {\n    int y;\n  }\n}";
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        // Line 2 (0-based) is inside method F.
+        let m = enclosing_method(&program, pos(2, 5)).unwrap();
+        assert_eq!(m.start.line, 2); // F() spans lines 2..4 (1-based)
+        // Line 5 (0-based) is inside method G.
+        let m = enclosing_method(&program, pos(5, 5)).unwrap();
+        assert_eq!(m.start.line, 5);
+        // Line 0 (0-based) is the class header, not inside any method.
+        assert!(enclosing_method(&program, pos(0, 5)).is_none());
+    }
+
+    #[test]
+    fn test_find_name_position() {
+        use crate::parser::{Position, Span};
+
+        // Cyrillic comment above the class — exercises char-vs-byte handling
+        // (must not panic on a non-char boundary, and must locate the name).
+        let text = "//! комментарий про бота\nclass dmAISurvivor\n{\n}";
+        let span = Span::new(Position::new(2, 1, 0), Position::new(4, 1, 0));
+        let (line, col) = find_name_position(text, &span, "dmAISurvivor").unwrap();
+        assert_eq!(line, 1); // 0-based line 1
+        assert_eq!(col, 6); // after "class "
+    }
+
+    #[test]
+    fn test_find_symbol_at_position_cyrillic() {
+        // A line whose identifier is preceded by multi-byte UTF-8 must not panic
+        // and must resolve the identifier (not a byte-index slice).
+        let text = "//! комментарий про бота: m_Weapon.";
+        // "m_Weapon" starts after "//! комментарий про бота: " = 29 chars.
+        let name = find_symbol_at_position(text, pos(0, 32)).unwrap();
+        assert_eq!(name, "m_Weapon");
+    }
+
+    #[test]
+    fn test_find_symbol_at_position_cyrillic_only() {
+        // Identifier that is itself Cyrillic.
+        let text = "// бот_идёт";
+        // "бот_идёт" starts at char 3 ("// "), cursor in the middle.
+        let name = find_symbol_at_position(text, pos(0, 5)).unwrap();
+        assert_eq!(name, "бот_идёт");
+    }
+
+    #[test]
+    fn test_find_member_in_hierarchy() {
+        use crate::parser::{Position, Span};
+
+        let mut index = SymbolIndex::default();
+        index
+            .class_parents
+            .insert("Child".to_string(), Some("Base".to_string()));
+        index.by_name.insert(
+            "m_value".to_string(),
+            vec![IndexedSymbol {
+                uri: "file:///base.c".to_string(),
+                symbol: crate::semantic::Symbol {
+                    name: "m_value".to_string(),
+                    kind: SymbolKind::Field,
+                    type_ref: None,
+                    span: Span::new(Position::new(1, 1, 0), Position::new(1, 2, 1)),
+                    scope: 0,
+                    modifiers: Vec::new(),
+                    parent: Some("Base".to_string()),
+                    value: None,
+                },
+            }],
+        );
+
+        // A member inherited from `Base` resolves for `Child` (walk the hierarchy).
+        let found = find_member_in_hierarchy("Child", "m_value", &index).unwrap();
+        assert_eq!(found.symbol.parent.as_deref(), Some("Base"));
+        // Not part of the hierarchy → None.
+        assert!(find_member_in_hierarchy("Unrelated", "m_value", &index).is_none());
+    }
+
+    #[test]
+    fn test_is_class_member_of() {
+        use crate::parser::{Position, Span};
+
+        let mk = |name: &str, kind: SymbolKind, parent: Option<&str>| Symbol {
+            name: name.to_string(),
+            kind,
+            type_ref: None,
+            span: Span::new(Position::new(0, 0, 0), Position::new(0, 1, 1)),
+            scope: 0,
+            modifiers: Vec::new(),
+            parent: parent.map(|s| s.to_string()),
+            value: None,
+        };
+
+        // A field/method of the current class → a class member.
+        assert!(is_class_member_of(&mk("m_x", SymbolKind::Field, Some("A")), "A"));
+        assert!(is_class_member_of(&mk("Do", SymbolKind::Method, Some("A")), "A"));
+        // A member of an unrelated class → NOT a member of `A`.
+        assert!(!is_class_member_of(&mk("m_x", SymbolKind::Field, Some("B")), "A"));
+        // Globals and locals are handled separately (not class members).
+        assert!(!is_class_member_of(&mk("F", SymbolKind::Function, None), "A"));
+        assert!(!is_class_member_of(&mk("local", SymbolKind::Variable, Some("A")), "A"));
+    }
 }

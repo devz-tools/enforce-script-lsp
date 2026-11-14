@@ -1,0 +1,87 @@
+{
+  "name": "Enforce Script",
+  "scopeName": "source.enforcescript",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#preprocessor" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#modifiers" },
+    { "include": "#constants" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block",
+          "begin": "/\\*",
+          "end": "\\*/"
+        },
+        {
+          "name": "comment.line.double-slash",
+          "match": "//.*"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "numbers": {
+      "name": "constant.numeric",
+      "match": "\\b(0[xX][0-9a-fA-F]+|\\d+(\\.\\d+)?([eE][+-]?\\d+)?[fF]?)\\b"
+    },
+    "preprocessor": {
+      "patterns": [
+        {
+          "match": "(#)\\s*(ifdef|ifndef|else|endif|include|define|undef|pragma|error|warning)\\b",
+          "captures": {
+            "1": { "name": "punctuation.definition.directive" },
+            "2": { "name": "keyword.control.directive" }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control",
+          "match": "\\b(if|else|switch|case|default|for|foreach|while|break|continue|return)\\b"
+        },
+        {
+          "name": "keyword.other",
+          "match": "\\b(class|enum|typedef|extends|modded|typename)\\b"
+        },
+        {
+          "name": "keyword.operator.word",
+          "match": "\\b(new|delete)\\b"
+        }
+      ]
+    },
+    "types": {
+      "name": "storage.type",
+      "match": "\\b(void|int|float|bool|string|vector|auto)\\b"
+    },
+    "modifiers": {
+      "name": "storage.modifier",
+      "match": "\\b(private|protected|static|override|const|ref|autoptr|out|inout|thread|proto|native)\\b"
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language",
+          "match": "\\b(true|false|null|this|super)\\b"
+        }
+      ]
+    }
+  }
+}

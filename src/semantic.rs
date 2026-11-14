@@ -1,7 +1,114 @@
 /// Semantic analyzer for Enforce Script
 /// Performs type checking, scope resolution, and builds symbol table
 use crate::parser::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// C++ engine constants/enums that are available in vanilla scripts without a
+/// script-side declaration. The analyzer flags these as "Undefined identifier"
+/// otherwise, producing false positives. (Do NOT add `#ifdef`-gated enums here;
+/// those are handled separately via `DEFAULT_DEFINES`.)
+const KNOWN_ENGINE_CONSTANTS: &[&str] = &[
+    "UAAction",
+    "UAAimDown",
+    "UAAimLeft",
+    "UAAimRight",
+    "UAAimUp",
+    "UACarShiftGearDown",
+    "UACarShiftGearUp",
+    "UAChat",
+    "UADefaultAction",
+    "UADropitem",
+    "UAGear",
+    "UAGetOver",
+    "UALeanLeft",
+    "UALeanRight",
+    "UALookAround",
+    "UAMapToggle",
+    "UAMoveBack",
+    "UAMoveForward",
+    "UAMoveLeft",
+    "UAMoveRight",
+    "UANextAction",
+    "UANextActionCategory",
+    "UAPersonView",
+    "UAPrevAction",
+    "UAPrevActionCategory",
+    "UAReloadMagazine",
+    "UASwitchPreset",
+    "UATempRaiseWeapon",
+    "UAThrowitem",
+    "UAToggleWeapons",
+    "UATurbo",
+    "UAUIBack",
+    "UAUICombine",
+    "UAUICopyDebugMonitorPos",
+    "UAUICredits",
+    "UAUICtrlX",
+    "UAUICtrlY",
+    "UAUIDown",
+    "UAUIGesturesOpen",
+    "UAUILeft",
+    "UAUIMenu",
+    "UAUINextDown",
+    "UAUINextUp",
+    "UAUIQuickbarRadialOpen",
+    "UAUIQuickbarToggle",
+    "UAUIRight",
+    "UAUIRotateInventory",
+    "UAUISelect",
+    "UAUITabLeft",
+    "UAUITabRight",
+    "UAUIThumbRight",
+    "UAUIUp",
+    "UAVoiceDistanceDown",
+    "UAVoiceDistanceUp",
+    "UAWalkRunForced",
+    "UAWalkRunTemp",
+    "UAZeroingDown",
+    "UAZeroingUp",
+    "UAZoomInOptics",
+    "UAZoomInOpticsControllerHelper",
+    "UAZoomOutOptics",
+    "UAZoomOutOpticsControllerHelper",
+    "DBB_CANCEL",
+    "DBB_NO",
+    "DBB_NONE",
+    "DBB_OK",
+    "DBB_YES",
+    "DBT_OK",
+    "DBT_YESNO",
+    "DBT_YESNOCANCEL",
+    "DMT_EXCLAMATION",
+    "DMT_INFO",
+    "DMT_QUESTION",
+    "CCAdmin",
+    "CCBattlEye",
+    "CCDirect",
+    "CCMegaphone",
+    "CCPublicAddressSystem",
+    "CCSystem",
+    "CCTransmitter",
+    "CT_ARRAY",
+    "CT_CLASS",
+    "DT_CUSTOM",
+    "EUAINPUT_DEVICE_CONTROLLER",
+    "EUAINPUT_DEVICE_KEYBOARD",
+    "EUAINPUT_DEVICE_KEYBOARDMOUSE",
+    "EUAINPUT_DEVICE_MOUSE",
+    "FLT_MAX",
+    "FLT_MIN",
+    "MB_PRESSED_MASK",
+    "OPTIONS_FIELD_OF_VIEW_MAX",
+    "OPTIONS_FIELD_OF_VIEW_MIN",
+    "ChatMaxSystemLength",
+    "ChatMaxUserLength",
+    "HIDE_INV_FROM_SCRIPT",
+    "LOCK_FROM_SCRIPT",
+    "FrameWidgetTypeID",
+    "WindowsResizeEventTypeID",
+    "LinebreakOverrideMode",
+    "VoiceEffectObstruction",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SymbolKind {
@@ -26,6 +133,9 @@ pub struct Symbol {
     pub scope: usize,
     pub modifiers: Vec<String>,
     pub parent: Option<String>, // Parent class/enum name
+    /// Literal value of a constant/field initializer (e.g. `= 50.0`), shown in
+    /// hover. `None` for complex or absent initializers.
+    pub value: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,12 +173,18 @@ impl SymbolTable {
     pub fn define(&mut self, symbol: Symbol) -> Result<(), String> {
         let name = symbol.name.clone();
 
-        // Check for duplicate in current scope
+        // Check for duplicate in current scope. Method overloading (same name,
+        // different parameters — or static vs instance) is legal in Enforce, so
+        // same-named methods are not duplicates.
         if let Some(existing) = self.scopes[self.current_scope].get(&name) {
-            return Err(format!(
-                "Symbol '{}' already defined in current scope at line {}",
-                name, existing.span.start.line
-            ));
+            let both_methods = matches!(symbol.kind, SymbolKind::Method)
+                && matches!(existing.kind, SymbolKind::Method);
+            if !both_methods {
+                return Err(format!(
+                    "Symbol '{}' already defined in current scope at line {}",
+                    name, existing.span.start.line
+                ));
+            }
         }
 
         // Add to current scope
@@ -136,6 +252,47 @@ pub struct SemanticAnalyzer {
     errors: Vec<String>,
     warnings: Vec<String>,
     class_hierarchy: HashMap<String, Option<String>>, // class -> parent class
+    global_env: GlobalEnvironment,
+    /// Lenient member scoping: treat a bare name as defined if it's a member of
+    /// *any* class (default false — strict namespace model).
+    lenient_member_scope: bool,
+    /// Suppress "Undefined identifier" warnings (used while the cross-file
+    /// index is still building — cross-file symbols would read as undefined).
+    suppress_undefined: bool,
+}
+
+/// Cross-file symbol environment: globals, class hierarchy and members, used to
+/// resolve identifiers that live outside the current file (inherited fields,
+/// global enums/classes/functions/constants).
+#[derive(Debug, Default, Clone)]
+pub struct GlobalEnvironment {
+    /// Names of global symbols (classes, enums, typedefs, functions, globals).
+    pub globals: HashSet<String>,
+    /// class name → parent class name (from `class X : Parent`).
+    pub class_parents: HashMap<String, Option<String>>,
+    /// class name → set of member names (fields, methods, enum variants).
+    pub class_members: HashMap<String, HashSet<String>>,
+    /// Every member name across all classes (union of `class_members` values).
+    /// Used as a lenient "is this name defined anywhere" fallback, so a broken
+    /// inheritance chain (a parent file that fails to parse) doesn't flood
+    /// "undefined identifier" noise.
+    pub all_members: HashSet<String>,
+}
+
+impl GlobalEnvironment {
+    /// Whether `name` is a member of `class` or any of its ancestors.
+    pub fn has_member(&self, class: &str, name: &str) -> bool {
+        let mut current = Some(class.to_string());
+        while let Some(c) = current {
+            if let Some(members) = self.class_members.get(&c)
+                && members.contains(name)
+            {
+                return true;
+            }
+            current = self.class_parents.get(&c).cloned().flatten();
+        }
+        false
+    }
 }
 
 impl SemanticAnalyzer {
@@ -145,7 +302,22 @@ impl SemanticAnalyzer {
             errors: Vec::new(),
             warnings: Vec::new(),
             class_hierarchy: HashMap::new(),
+            global_env: GlobalEnvironment::default(),
+            lenient_member_scope: false,
+            suppress_undefined: false,
         }
+    }
+
+    pub fn set_global_environment(&mut self, env: GlobalEnvironment) {
+        self.global_env = env;
+    }
+
+    pub fn set_lenient_member_scope(&mut self, lenient: bool) {
+        self.lenient_member_scope = lenient;
+    }
+
+    pub fn set_suppress_undefined(&mut self, suppress: bool) {
+        self.suppress_undefined = suppress;
     }
 
     pub fn analyze(&mut self, program: &Program) -> Result<(), Vec<String>> {
@@ -161,7 +333,15 @@ impl SemanticAnalyzer {
                 Declaration::Typedef(typedef) => {
                     self.register_typedef(typedef)?;
                 }
-                Declaration::Function(_) => {} // Handle in second pass
+                Declaration::Variable(field) => {
+                    self.register_global_variable(field)?;
+                }
+                Declaration::Function(function) => {
+                    // Register module-level functions up front so forward
+                    // references resolve (e.g. `Class.Func()` before `Func`'s
+                    // declaration). The body is analyzed in the second pass.
+                    self.register_method(function, None)?;
+                }
             }
         }
 
@@ -172,7 +352,8 @@ impl SemanticAnalyzer {
                     self.analyze_class(class)?;
                 }
                 Declaration::Function(function) => {
-                    self.analyze_function(function)?;
+                    // Already registered in the first pass; analyze the body now.
+                    self.analyze_method_body(function, None)?;
                 }
                 _ => {}
             }
@@ -208,6 +389,7 @@ impl SemanticAnalyzer {
             scope: 0, // Classes are always in global scope
             modifiers: class.modifiers.clone(),
             parent: None,
+            value: None,
         };
 
         if let Err(e) = self.symbol_table.define(symbol) {
@@ -234,6 +416,7 @@ impl SemanticAnalyzer {
             scope: 0,
             modifiers: Vec::new(),
             parent: None,
+            value: None,
         };
 
         if let Err(e) = self.symbol_table.define(symbol) {
@@ -250,6 +433,7 @@ impl SemanticAnalyzer {
                 scope: 0,
                 modifiers: Vec::new(),
                 parent: Some(enum_decl.name.clone()),
+                value: None,
             };
 
             if let Err(e) = self.symbol_table.define(variant_symbol) {
@@ -269,6 +453,26 @@ impl SemanticAnalyzer {
             scope: 0,
             modifiers: Vec::new(),
             parent: None,
+            value: None,
+        };
+
+        if let Err(e) = self.symbol_table.define(symbol) {
+            self.errors.push(e);
+        }
+
+        Ok(())
+    }
+
+    fn register_global_variable(&mut self, field: &Field) -> Result<(), Vec<String>> {
+        let symbol = Symbol {
+            name: field.name.clone(),
+            kind: SymbolKind::Variable,
+            type_ref: Some(field.type_ref.clone()),
+            span: field.span.clone(),
+            scope: 0,
+            modifiers: field.modifiers.clone(),
+            parent: None,
+            value: field.initializer.as_ref().and_then(literal_value),
         };
 
         if let Err(e) = self.symbol_table.define(symbol) {
@@ -280,6 +484,9 @@ impl SemanticAnalyzer {
 
     fn analyze_class(&mut self, class: &Class) -> Result<(), Vec<String>> {
         self.symbol_table.current_class = Some(class.name.clone());
+        // Class members live in their own scope, so same-named members across
+        // different classes (e.g. `MIN` in `class int` and `class float`) don't collide.
+        self.symbol_table.enter_scope();
 
         // Register fields
         for field in &class.fields {
@@ -291,6 +498,7 @@ impl SemanticAnalyzer {
                 scope: 0,
                 modifiers: field.modifiers.clone(),
                 parent: Some(class.name.clone()),
+                value: field.initializer.as_ref().and_then(literal_value),
             };
 
             if let Err(e) = self.symbol_table.define(symbol) {
@@ -303,24 +511,29 @@ impl SemanticAnalyzer {
             }
         }
 
-        // Analyze methods
+        // Register all methods first (so forward references within the class
+        // resolve), then analyze their bodies.
         for method in &class.methods {
-            self.analyze_method(method, Some(class.name.clone()))?;
+            self.register_method(method, Some(class.name.clone()))?;
+        }
+        for method in &class.methods {
+            self.analyze_method_body(method, Some(class.name.clone()))?;
         }
 
+        self.symbol_table.exit_scope();
         self.symbol_table.current_class = None;
         Ok(())
     }
 
-    fn analyze_function(&mut self, function: &Method) -> Result<(), Vec<String>> {
-        self.analyze_method(function, None)
-    }
-
-    fn analyze_method(
+    fn register_method(
         &mut self,
         method: &Method,
         class_name: Option<String>,
     ) -> Result<(), Vec<String>> {
+        // A method whose name equals its class name is a constructor — it must not
+        // collide with the class symbol that lives in the same scope.
+        let is_constructor = class_name.as_deref() == Some(method.name.as_str());
+
         let symbol = Symbol {
             name: method.name.clone(),
             kind: if class_name.is_some() {
@@ -333,12 +546,23 @@ impl SemanticAnalyzer {
             scope: 0,
             modifiers: method.modifiers.clone(),
             parent: class_name.clone(),
+            value: None,
         };
 
         if let Err(e) = self.symbol_table.define(symbol) {
-            self.errors.push(e);
+            if !is_constructor {
+                self.errors.push(e);
+            }
         }
 
+        Ok(())
+    }
+
+    fn analyze_method_body(
+        &mut self,
+        method: &Method,
+        class_name: Option<String>,
+    ) -> Result<(), Vec<String>> {
         // Enter method scope
         self.symbol_table.enter_scope();
 
@@ -352,6 +576,7 @@ impl SemanticAnalyzer {
                 scope: self.symbol_table.current_scope,
                 modifiers: param.modifiers.clone(),
                 parent: class_name.clone(),
+                value: None,
             };
 
             if let Err(e) = self.symbol_table.define(param_symbol) {
@@ -375,38 +600,42 @@ impl SemanticAnalyzer {
             Statement::VariableDeclaration {
                 modifiers,
                 type_ref,
-                name,
-                initializer,
+                declarators,
                 span,
             } => {
-                let symbol = Symbol {
-                    name: name.clone(),
-                    kind: SymbolKind::Variable,
-                    type_ref: Some(type_ref.clone()),
-                    span: span.clone(),
-                    scope: self.symbol_table.current_scope,
-                    modifiers: modifiers.clone(),
-                    parent: self.symbol_table.current_class.clone(),
-                };
+                for (name, initializer) in declarators {
+                    let symbol = Symbol {
+                        name: name.clone(),
+                        kind: SymbolKind::Variable,
+                        type_ref: Some(type_ref.clone()),
+                        span: span.clone(),
+                        scope: self.symbol_table.current_scope,
+                        modifiers: modifiers.clone(),
+                        parent: self.symbol_table.current_class.clone(),
+                        value: initializer.as_ref().and_then(literal_value),
+                    };
 
-                if let Err(e) = self.symbol_table.define(symbol) {
-                    self.errors.push(e);
-                }
+                    if let Err(e) = self.symbol_table.define(symbol) {
+                        self.errors.push(e);
+                    }
 
-                if let Some(init) = initializer {
-                    self.analyze_expression(init)?;
-                    // TODO: Type check initializer against variable type
+                    if let Some(init) = initializer {
+                        self.analyze_expression(init)?;
+                        // TODO: Type check initializer against variable type
+                    }
                 }
             }
             Statement::Expression { expression, .. } => {
                 self.analyze_expression(expression)?;
             }
+            // Enforce has no block scope: a variable declared inside any block
+            // (or a for/foreach initializer) is method/function-scoped — visible
+            // from its declaration line to the end of the method, regardless of
+            // `{}` nesting. So blocks do NOT open a new scope.
             Statement::Block { statements, .. } => {
-                self.symbol_table.enter_scope();
                 for stmt in statements {
                     self.analyze_statement(stmt)?;
                 }
-                self.symbol_table.exit_scope();
             }
             Statement::If {
                 condition,
@@ -440,7 +669,6 @@ impl SemanticAnalyzer {
                 body,
                 ..
             } => {
-                self.symbol_table.enter_scope();
                 if let Some(init) = initializer {
                     self.analyze_statement(init)?;
                 }
@@ -451,7 +679,6 @@ impl SemanticAnalyzer {
                     self.analyze_expression(inc)?;
                 }
                 self.analyze_statement(body)?;
-                self.symbol_table.exit_scope();
             }
             Statement::Foreach {
                 key_var,
@@ -460,8 +687,6 @@ impl SemanticAnalyzer {
                 body,
                 ..
             } => {
-                self.symbol_table.enter_scope();
-
                 if let Some((key_type, key_name)) = key_var {
                     let key_symbol = Symbol {
                         name: key_name.clone(),
@@ -471,6 +696,7 @@ impl SemanticAnalyzer {
                         scope: self.symbol_table.current_scope,
                         modifiers: Vec::new(),
                         parent: self.symbol_table.current_class.clone(),
+                        value: None,
                     };
                     if let Err(e) = self.symbol_table.define(key_symbol) {
                         self.errors.push(e);
@@ -486,6 +712,7 @@ impl SemanticAnalyzer {
                     scope: self.symbol_table.current_scope,
                     modifiers: Vec::new(),
                     parent: self.symbol_table.current_class.clone(),
+                    value: None,
                 };
                 if let Err(e) = self.symbol_table.define(value_symbol) {
                     self.errors.push(e);
@@ -493,7 +720,6 @@ impl SemanticAnalyzer {
 
                 self.analyze_expression(iterable)?;
                 self.analyze_statement(body)?;
-                self.symbol_table.exit_scope();
             }
             Statement::While {
                 condition, body, ..
@@ -520,8 +746,27 @@ impl SemanticAnalyzer {
             Expression::Identifier(name, span) => {
                 // Check if identifier is defined
                 if self.symbol_table.lookup(name).is_none() {
-                    // Check if it's an enum variant
-                    if !name.contains('.') {
+                    // Resolve cross-file: a known global, or a member inherited
+                    // from an ancestor. A bare name that is a member of an
+                    // *unrelated* class is undefined (strict namespace model),
+                    // unless `lenient_member_scope` opts back into the
+                    // "member of any class" fallback.
+                    let known_global = self.global_env.globals.contains(name);
+                    let inherited = self
+                        .symbol_table
+                        .current_class
+                        .as_deref()
+                        .is_some_and(|c| self.global_env.has_member(c, name));
+                    let lenient_known = self.lenient_member_scope
+                        && self.global_env.all_members.contains(name);
+                    let engine_known = KNOWN_ENGINE_CONSTANTS.contains(&name.as_str());
+                    if !self.suppress_undefined
+                        && !name.contains('.')
+                        && !known_global
+                        && !inherited
+                        && !lenient_known
+                        && !engine_known
+                    {
                         self.warnings.push(format!(
                             "Undefined identifier '{}' at line {}",
                             name, span.start.line
@@ -548,11 +793,20 @@ impl SemanticAnalyzer {
             }
             Expression::MemberAccess {
                 object,
-                member: _,
-                span: _,
+                member,
+                span,
             } => {
                 self.analyze_expression(object)?;
-                // TODO: Check if member exists on object type
+                // A module-level function called as a static member (`Class.Func()`)
+                // is a mistake — flag it.
+                if let Some(class) = self.resolve_static_class(object)
+                    && self.is_global_function(member)
+                {
+                    self.warnings.push(format!(
+                        "Undefined member '{}' on type '{}' at line {}",
+                        member, class, span.start.line
+                    ));
+                }
             }
             Expression::Index { object, index, .. } => {
                 self.analyze_expression(object)?;
@@ -588,6 +842,26 @@ impl SemanticAnalyzer {
         }
         false
     }
+
+    /// If `object` is a class name (static access `Class.member`), return the
+    /// class name. `this`/`super`, variables, and enums are not static access.
+    fn resolve_static_class(&self, object: &Expression) -> Option<String> {
+        if let Expression::Identifier(name, _) = object {
+            let symbol = self.symbol_table.lookup(name)?;
+            if symbol.kind == SymbolKind::Class {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+
+    /// Whether `member` is a module-level function (a global, not a class member).
+    /// Calling such a function as `Class.Member()` is a mistake.
+    fn is_global_function(&self, member: &str) -> bool {
+        self.symbol_table
+            .lookup(member)
+            .is_some_and(|s| s.kind == SymbolKind::Function && s.parent.is_none())
+    }
 }
 
 #[cfg(test)]
@@ -595,6 +869,97 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+
+    #[test]
+    fn test_global_environment_has_member() {
+        let mut env = GlobalEnvironment::default();
+        env.class_parents
+            .insert("Child".to_string(), Some("Parent".to_string()));
+        env.class_parents
+            .insert("Parent".to_string(), Some("Grand".to_string()));
+        env.class_members
+            .entry("Grand".to_string())
+            .or_default()
+            .insert("m_legacy".to_string());
+        env.class_members
+            .entry("Parent".to_string())
+            .or_default()
+            .insert("m_base".to_string());
+
+        assert!(env.has_member("Child", "m_base"));
+        assert!(env.has_member("Child", "m_legacy")); // through two levels
+        assert!(!env.has_member("Child", "nope"));
+    }
+
+    #[test]
+    fn test_cross_file_inherited_and_global_resolution() {
+        // References a global enum and an inherited field, both "defined" in the
+        // environment — must not warn.
+        let code = r#"
+class Child : Parent
+{
+    void Child()
+    {
+        m_field = MyEnum.VALUE;
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut env = GlobalEnvironment::default();
+        env.class_parents
+            .insert("Child".to_string(), Some("Parent".to_string()));
+        env.class_members
+            .entry("Parent".to_string())
+            .or_default()
+            .insert("m_field".to_string());
+        env.globals.insert("MyEnum".to_string());
+
+        let mut analyzer = SemanticAnalyzer::new();
+        analyzer.set_global_environment(env);
+        let _ = analyzer.analyze(&program);
+
+        assert!(!analyzer
+            .warnings
+            .iter()
+            .any(|w| w.contains("m_field") || w.contains("MyEnum")));
+    }
+
+    #[test]
+    fn test_known_engine_constants_not_flagged() {
+        // Bare C++ engine constants (available without a script-side
+        // declaration) must not be reported as "undefined".
+        let code = r#"
+void Test()
+{
+    int a = DT_CUSTOM;
+    int b = UAChat;
+    int c = FLT_MAX;
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        let warnings = analyzer.get_warnings();
+        for name in ["DT_CUSTOM", "UAChat", "FLT_MAX"] {
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("Undefined identifier '{}'", name))),
+                "{} should be a known engine constant, got: {:?}",
+                name,
+                warnings
+            );
+        }
+    }
 
     #[test]
     fn test_semantic_analysis() {
@@ -645,6 +1010,180 @@ void Test()
         let _ = analyzer.analyze(&program);
 
         assert!(!analyzer.get_warnings().is_empty());
+    }
+
+    #[test]
+    fn test_multi_declarator_registers_all() {
+        // `int i = 0, nr = 5;` declares BOTH `i` and `nr` — the second name must
+        // also be registered (not dropped), so it is not reported "undefined".
+        let code = r#"
+void Test()
+{
+    int i = 0, nr = 5;
+    string bulletTypeName, ammoTypeName;
+    Print(i + nr + bulletTypeName + ammoTypeName);
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        let warnings = analyzer.get_warnings();
+        for name in ["nr", "ammoTypeName"] {
+            assert!(
+                !warnings.iter().any(|w| w.contains(&format!("Undefined identifier '{}'", name))),
+                "{} should be registered, got: {:?}",
+                name,
+                warnings
+            );
+        }
+    }
+
+    #[test]
+    fn test_for_loop_variable_is_method_scoped() {
+        // Enforce has no block scope: `i` declared in the first `for` initializer
+        // stays visible in a later block (e.g. a different `for` that only
+        // reassigns it), so it must not be flagged "undefined".
+        let code = r#"
+void Test()
+{
+    for (int i = 0; i < 4; i++)
+    {
+        Print(i);
+    }
+    if (true)
+    {
+        for (i = 0; i < 4; i++)
+        {
+            Print(i);
+        }
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        assert!(
+            !analyzer
+                .get_warnings()
+                .iter()
+                .any(|w| w.contains("Undefined identifier 'i'")),
+            "i should be method-scoped, but got: {:?}",
+            analyzer.get_warnings()
+        );
+    }
+
+    #[test]
+    fn test_undefined_member() {
+        // A module-level function called as a class member should be flagged.
+        let code = r#"
+class A
+{
+    void Bar()
+    {
+        A.Foo();
+    }
+}
+
+void Foo()
+{
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        let warnings = analyzer.get_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("Undefined member 'Foo'")),
+            "expected undefined member warning, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_defined_member_not_flagged() {
+        // A member that exists on the class should not be flagged.
+        let code = r#"
+class A
+{
+    void Foo() {}
+    void Bar()
+    {
+        A.Foo();
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        let warnings = analyzer.get_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.contains("Undefined member")),
+            "unexpected undefined member warning: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_lenient_member_scope() {
+        // A bare `Foo` that is a member of an unrelated class is undefined in
+        // strict mode, but "known" when `lenient_member_scope` is enabled.
+        let code = r#"
+class A
+{
+    void Bar()
+    {
+        Foo();
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut env = GlobalEnvironment::default();
+        env.all_members.insert("Foo".to_string());
+
+        // Strict (default): `Foo` is undefined.
+        let mut analyzer = SemanticAnalyzer::new();
+        analyzer.set_global_environment(env.clone());
+        let _ = analyzer.analyze(&program);
+        assert!(
+            analyzer.get_warnings().iter().any(|w| w.contains("Undefined identifier 'Foo'")),
+            "expected undefined 'Foo' in strict mode, got: {:?}",
+            analyzer.get_warnings()
+        );
+
+        // Lenient: `Foo` is considered known (member of some class).
+        let mut analyzer = SemanticAnalyzer::new();
+        analyzer.set_global_environment(env.clone());
+        analyzer.set_lenient_member_scope(true);
+        let _ = analyzer.analyze(&program);
+        assert!(
+            !analyzer.get_warnings().iter().any(|w| w.contains("Undefined identifier 'Foo'")),
+            "unexpected undefined 'Foo' in lenient mode: {:?}",
+            analyzer.get_warnings()
+        );
     }
 
     #[test]
@@ -1007,6 +1546,34 @@ class MyClass
 
         // Verify class is registered
         assert!(analyzer.symbol_table.lookup("MyClass").is_some());
+    }
+
+    #[test]
+    fn test_static_instance_overload_not_duplicate() {
+        // Static and instance methods may share a name in Enforce (different
+        // namespaces) — must not be reported as "already defined".
+        let code = r#"
+class MyClass
+{
+    bool Load()
+    {
+        return true;
+    }
+    static bool Load()
+    {
+        return false;
+    }
+}
+"#;
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let _ = analyzer.analyze(&program);
+
+        assert!(!analyzer.errors.iter().any(|e| e.contains("already defined")));
     }
 
     #[test]

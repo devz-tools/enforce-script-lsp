@@ -1,6 +1,8 @@
 /// Lexer for Enforce Script
 /// Tokenizes source code into a stream of tokens
 
+use std::collections::HashSet;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenType {
     // Keywords
@@ -63,6 +65,7 @@ pub enum TokenType {
     SlashAssign,
     OrAssign,
     AndAssign,
+    XorAssign,
     LeftShiftAssign,
     RightShiftAssign,
     Increment,
@@ -106,6 +109,7 @@ pub enum TokenType {
 
     // Special
     Comment(String),
+    Preprocessor(String),
     #[allow(dead_code)] // Reserved for potential whitespace-aware parsing
     Whitespace,
     Newline,
@@ -146,6 +150,9 @@ pub struct Lexer {
     line: usize,
     column: usize,
     offset: usize,
+    /// Active preprocessor defines (from the module's `config.cpp` `defines[]`).
+    /// Empty = skip all `#ifdef` blocks (default, when no config is known).
+    active_defines: HashSet<String>,
 }
 
 impl Lexer {
@@ -156,23 +163,60 @@ impl Lexer {
             line: 1,
             column: 1,
             offset: 0,
+            active_defines: HashSet::new(),
         }
+    }
+
+    pub fn set_active_defines(&mut self, defines: &HashSet<String>) {
+        self.active_defines = defines.clone();
     }
 
     pub fn tokenize(&mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
+        // Conditional stack: each element is whether the current branch at that
+        // nesting level is active. A token is emitted only when all are true.
+        let mut cond_stack: Vec<bool> = Vec::new();
 
         loop {
             let token = self.next_token();
             let is_eof = matches!(token.token_type, TokenType::Eof);
 
-            // Skip whitespace and newlines for now, but keep them for future use
-            if !matches!(token.token_type, TokenType::Whitespace | TokenType::Newline) {
+            if is_eof {
                 tokens.push(token);
+                break;
             }
 
-            if is_eof {
-                break;
+            match &token.token_type {
+                TokenType::Preprocessor(directive) => {
+                    let mut words = directive.split_whitespace();
+                    let kw = words.next().unwrap_or("");
+                    match kw {
+                        "ifdef" => {
+                            let name = words.next().unwrap_or("");
+                            cond_stack.push(self.active_defines.contains(name));
+                        }
+                        "ifndef" => {
+                            let name = words.next().unwrap_or("");
+                            cond_stack.push(!self.active_defines.contains(name));
+                        }
+                        "else" => {
+                            if let Some(last) = cond_stack.last_mut() {
+                                *last = !*last;
+                            }
+                        }
+                        "endif" => {
+                            cond_stack.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                TokenType::Whitespace | TokenType::Newline => {}
+                _ => {
+                    if !cond_stack.iter().all(|&b| b) {
+                        continue;
+                    }
+                    tokens.push(token);
+                }
             }
         }
 
@@ -211,6 +255,11 @@ impl Lexer {
             } else if self.peek(1) == Some('*') {
                 return self.scan_multi_line_comment(start_line, start_column, start_offset);
             }
+        }
+
+        // Handle preprocessor directives (#ifdef, #endif, #include, ...)
+        if ch == '#' {
+            return self.scan_preprocessor(start_line, start_column, start_offset);
         }
 
         // Handle string literals
@@ -273,10 +322,8 @@ impl Lexer {
                 self.advance(); // '/'
                 break;
             }
-            if self.current_char() == '\n' {
-                self.line += 1;
-                self.column = 0;
-            }
+            // Note: `advance()` already increments `line` on '\n' — don't count
+            // it again here (that would double-count lines in block comments).
             self.advance();
         }
 
@@ -284,6 +331,25 @@ impl Lexer {
         Token::new(
             TokenType::Comment(comment_text.clone()),
             comment_text,
+            line,
+            column,
+            offset,
+        )
+    }
+
+    fn scan_preprocessor(&mut self, line: usize, column: usize, offset: usize) -> Token {
+        self.advance(); // '#'
+        let start = self.position;
+
+        while !self.is_at_end() && self.current_char() != '\n' {
+            self.advance();
+        }
+
+        let text: String = self.input[start..self.position].iter().collect();
+        let directive = text.trim().to_string();
+        Token::new(
+            TokenType::Preprocessor(directive.clone()),
+            directive,
             line,
             column,
             offset,
@@ -418,11 +484,35 @@ impl Lexer {
             "enum" => TokenType::Enum,
             "typedef" => TokenType::Typedef,
             "void" => TokenType::Void,
+            "int" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "int" => TokenType::Int,
+            "float" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "float" => TokenType::Float,
+            "bool" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "bool" => TokenType::Bool,
+            // `string` is both a primitive type and a global object with static
+            // members (e.g. `string.Empty`) — same rule as `vector` below.
+            "string" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "string" => TokenType::String,
+            // `vector` is both a primitive type and a global object (e.g. `vector.Distance`).
+            // When immediately followed by '.', it's the object — emit an identifier.
+            "vector" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "vector" => TokenType::Vector,
+            // `typename` is both a primitive type and a global object
+            // (e.g. `typename.EnumToString`), same as `vector`.
+            "typename" if !self.is_at_end() && self.current_char() == '.' => {
+                TokenType::Identifier(lexeme.clone())
+            }
             "typename" => TokenType::Typename,
             "auto" => TokenType::Auto,
             "autoptr" => TokenType::Autoptr,
@@ -442,6 +532,8 @@ impl Lexer {
             "super" => TokenType::Super,
             "return" => TokenType::Return,
             "null" => TokenType::Null,
+            // DayZ also uses the uppercase `NULL` as a null literal.
+            "NULL" => TokenType::Null,
             "true" => TokenType::True,
             "false" => TokenType::False,
             "thread" => TokenType::Thread,
@@ -591,7 +683,14 @@ impl Lexer {
                     TokenType::BitwiseOr
                 }
             }
-            '^' => TokenType::BitwiseXor,
+            '^' => {
+                if !self.is_at_end() && self.current_char() == '=' {
+                    self.advance();
+                    TokenType::XorAssign
+                } else {
+                    TokenType::BitwiseXor
+                }
+            }
             '?' => TokenType::Question,
             _ => TokenType::Unknown(ch),
         };
@@ -715,6 +814,51 @@ mod tests {
         assert_eq!(tokens.len(), 3); // 2 comments + EOF
         assert!(matches!(tokens[0].token_type, TokenType::Comment(_)));
         assert!(matches!(tokens[1].token_type, TokenType::Comment(_)));
+    }
+
+    fn identifiers_of(tokens: &[Token]) -> Vec<String> {
+        tokens
+            .iter()
+            .filter_map(|t| match &t.token_type {
+                TokenType::Identifier(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_preprocessor_no_defines_skips_all() {
+        let code = "#ifdef A\nint kept_a;\n#endif\nint always;\n";
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let ids = identifiers_of(&tokens);
+        assert!(ids.contains(&"always".to_string()));
+        assert!(!ids.contains(&"kept_a".to_string()));
+    }
+
+    #[test]
+    fn test_preprocessor_ifdef_active_keep() {
+        let code = "#ifdef A\nint kept_a;\n#endif\n#ifdef B\nint kept_b;\n#endif\nint always;\n";
+        let mut lexer = Lexer::new(code);
+        lexer.set_active_defines(&["A".to_string()].into_iter().collect());
+        let tokens = lexer.tokenize();
+        let ids = identifiers_of(&tokens);
+        assert!(ids.contains(&"kept_a".to_string()));
+        assert!(ids.contains(&"always".to_string()));
+        assert!(!ids.contains(&"kept_b".to_string()));
+    }
+
+    #[test]
+    fn test_preprocessor_ifndef_and_else() {
+        let code = "#ifndef SERVER\nint client;\n#else\nint server;\n#endif\nint always;\n";
+        let mut lexer = Lexer::new(code);
+        lexer.set_active_defines(&["SERVER".to_string()].into_iter().collect());
+        let tokens = lexer.tokenize();
+        let ids = identifiers_of(&tokens);
+        // SERVER is defined → #ifndef SERVER is false → skip client, take else (server)
+        assert!(ids.contains(&"server".to_string()));
+        assert!(!ids.contains(&"client".to_string()));
+        assert!(ids.contains(&"always".to_string()));
     }
 
     #[test]

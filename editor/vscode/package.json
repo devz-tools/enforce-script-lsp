@@ -1,0 +1,71 @@
+{
+  "name": "enforce-script-lsp-local",
+  "displayName": "Enforce Script LSP (Local)",
+  "description": "Run a local Enforce Script language server in VS Code or Cursor.",
+  "version": "0.1.0",
+  "publisher": "local-dayz",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:enforcescript"
+  ],
+  "contributes": {
+    "grammars": [
+      {
+        "language": "enforcescript",
+        "scopeName": "source.enforcescript",
+        "path": "./syntaxes/enforcescript.tmLanguage.json"
+      }
+    ],
+    "languages": [
+      {
+        "id": "enforcescript",
+        "aliases": [
+          "Enforce Script"
+        ],
+        "extensions": [
+          ".c"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "Enforce Script LSP (Local)",
+      "properties": {
+        "enforceScriptLsp.serverPath": {
+          "type": "string",
+          "default": "enforce-script-lsp",
+          "description": "Absolute path or executable name of the Enforce Script LSP server."
+        },
+        "enforceScriptLsp.dependencyRoots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional source roots to index (vanilla / Expansion script directories)."
+        },
+        "enforceScriptLsp.defaultDefines": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Default preprocessor defines applied to every file (engine feature flags, e.g. FEATURE_NETWORK_RECONCILIATION)."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.9.2"
+  },
+  "scripts": {
+    "package": "vsce package"
+  },
+  "license": "GPL-3.0"
+}

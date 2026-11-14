@@ -1,8 +1,11 @@
+mod index;
 mod lexer;
+mod lint;
 mod lsp;
 mod parser;
 mod semantic;
 mod utils;
+mod workspace;
 
 use tokio::main as tokio_main;
 

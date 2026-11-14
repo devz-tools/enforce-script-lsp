@@ -3,6 +3,8 @@
 This project contains an implementation of an LSP (language server protocol) for the Enforce Script programming language used with the Enfusion game engine and for modding video games such as DayZ.
 The LSP is implemented using Rust and the `tower-lsp` library, primarily for use within Visual Studio Code via the `devz-tools` extension.
 
+It is a **project-aware** language server: it discovers a mod's `config.cpp` files, indexes the whole project (and, optionally, the vanilla engine scripts and other dependency roots), and resolves symbols across files and up the inheritance chain.
+
 ## Project Structure
 
 ```
@@ -11,20 +13,20 @@ enforce-script-lsp/
 ├── AGENTS.md               # This file - developer guide for AI agents
 ├── ENFORCE-SCRIPT-SYNTAX.md # Complete Enforce Script language specification
 ├── README.md               # User-facing documentation with quick start
-├── TUTORIAL.md             # Comprehensive tutorial for users and developers
-├── CONTRIBUTING.md         # Guidelines for contributors
-├── IMPLEMENTATION.md       # Implementation summary and architecture overview
 └── src/
     ├── main.rs            # Entry point (~15 lines)
-    ├── lexer.rs           # Tokenizer (~1,100+ lines, 38 tests)
-    ├── parser.rs          # AST generator (~2,200+ lines, 34 tests)
-    ├── semantic.rs        # Symbol tables & analysis (~1,050+ lines, 20 tests)
-    ├── lsp.rs             # LSP server implementation (~472 lines)
+    ├── lexer.rs           # Tokenizer + preprocessor (#ifdef/#ifndef/#else/#endif)
+    ├── parser.rs          # AST generator (recursive descent)
+    ├── semantic.rs        # Per-file symbol tables + GlobalEnvironment (cross-file)
+    ├── workspace.rs       # config.cpp discovery, prefix map, compiled dirs
+    ├── index.rs           # cross-file SymbolIndex + class hierarchy
+    ├── lint.rs            # Enforce-specific lint checks
+    ├── lsp.rs             # LSP server implementation (tower-lsp)
     └── utils/             # Utility modules
         ├── mod.rs         # Module declarations with doc comments
-        ├── position.rs    # Position and Span types (~200 lines, 4 tests)
-        ├── error.rs       # Error types and handling (~120 lines, 2 tests)
-        └── diagnostics.rs # Diagnostic utilities (~180 lines, 4 tests)
+        ├── position.rs    # Position and Span types
+        ├── error.rs       # Error types and handling
+        └── diagnostics.rs # Diagnostic utilities
 ```
 
 ## Core Components
@@ -39,7 +41,9 @@ enforce-script-lsp/
   - Integer, float, and hex literals
   - Single-line (`//`) and multi-line (`/* */`) comments
   - Vector literals (e.g., `"1 2 3"`)
-- **Tests**: 38 comprehensive unit tests covering all keywords, operators, literals (int, float, hex, string, bool, vector), comments, escape sequences, template syntax, modifiers, and special syntax
+  - The `#ifdef`/`#ifndef`/`#else`/`#endif` preprocessor (evaluated against active defines)
+  - Primitive types as objects/values: `string`/`float`/`int`/`bool`/`vector`/`typename`
+    followed by `.` are emitted as identifiers so `string.Empty` is a member access.
 
 ### 2. Parser (`src/parser.rs`)
 - **Purpose**: Parses tokens into Abstract Syntax Tree (AST)
@@ -52,12 +56,16 @@ enforce-script-lsp/
   - Full expression parsing (binary, unary, call, member access, array access, new, cast, ternary)
   - All statement types (if, switch, for, foreach, while, return, break, continue, delete)
   - Variable declarations with type inference (`auto`)
-  - Template types (array<T>, map<K,V>)
-- **Tests**: 34 comprehensive unit tests covering classes, inheritance, modded classes, constructors/destructors, method modifiers, variables, functions with params, control flow (if/switch/for/foreach/while), arrays, templates, vectors, object creation, enums, strings, this/super, operators, member access, typedef, ref keyword, function overloading, ternary operator, and nested expressions
+  - Template types (array<T>, map<K,V>), including nested generics (`map<string, ref array<int>>`)
+  - `[attr]` registration attributes, `(ClassName)expr`/`(Type){...}` casts, `.!` negated
+    member access, compound assignment (`^=`), and the `default` soft keyword.
+  - Tolerates incomplete code while the editor awaits completion: an incomplete member access
+    (`obj.` with no member yet) yields an empty member name, and an expression statement may
+    omit the trailing `;` before `}`/EOF.
 
 ### 3. Semantic Analyzer (`src/semantic.rs`)
 - **Purpose**: Builds symbol tables and performs semantic analysis
-- **Key Types**: `SemanticAnalyzer`, `SymbolTable`, `Symbol`, `SymbolKind`
+- **Key Types**: `SemanticAnalyzer`, `SymbolTable`, `Symbol`, `SymbolKind`, `GlobalEnvironment`
 - **Functionality**:
   - Two-pass analysis (declaration registration, then body analysis)
   - Symbol resolution across scopes
@@ -66,9 +74,40 @@ enforce-script-lsp/
   - Duplicate declaration detection
   - Scope management (global, class, method, block)
   - Class hierarchy tracking
-- **Tests**: 20 comprehensive unit tests covering symbol resolution, undefined variables, duplicate functions, class inheritance, enums, variable scoping, nested scopes, parameters, class members, forward references, const values, modded classes, static members, templates, auto type inference, arrays, typedefs, ref/autoptr, constructors, method access modifiers, and loop variables
+  - Cross-file resolution via `GlobalEnvironment` (globals, class hierarchy, inherited members)
 
-### 4. LSP Server (`src/lsp.rs`)
+### 4. Workspace (`src/workspace.rs`)
+Discovers every `config.cpp` under the project root, parses `dir`/`files[]`/`defines[]`, and
+builds:
+- `prefix_map`: `files[]` prefix (`my_mod`) → directory of the declaring `config.cpp`.
+- `compiled_dirs`: absolute paths that actually enter compilation.
+- `dependency_roots`: extra roots (e.g. the vanilla engine scripts) indexed "lightly".
+- `defines_for(path)`: walk up to the nearest `config.cpp`, return its `defines[]`.
+- `is_compiled(path)`: is the file under a compiled directory?
+
+Handles **two config.cpp styles**: prefix (`my_mod/3_Game`) and full-path
+(`SomeMod/Core/Scripts/3_Game`).
+
+### 5. Symbol Index (`src/index.rs`)
+`name → Vec<IndexedSymbol{uri, symbol}>` (definitions) + `class_parents`. Built by walking
+compiled dirs + dependency roots, parsing each `.c`, and extracting **signatures straight from
+the AST** (no `SemanticAnalyzer` pass) — fast and error-tolerant on engine code. It also collects
+identifier *usages* (`by_usage`) and, in a second pass after the whole index is built, resolves
+each usage to a scope-aware identity (`g:`/`m:`/`l:`) into `by_identity` (powers find-references).
+`environment()` derives a `GlobalEnvironment` used to resolve cross-file identifiers.
+
+### 6. Lint (`src/lint.rs`)
+Enforce-specific checks with thresholds in `LintConfig` (tuned to Enforce engine limits): long
+`+` chain (>15), long `||`/`&&` chain (>8), a `&&`/`||` nested inside a string `+` expression
+(a native engine crash — a nesting trigger, distinct from chain length), ternary (forbidden),
+line break after `.` (forbidden), duplicate variable declaration in a method (Enforce has no
+block scope), field/variable shadowing a built-in class name. Each finding is a
+`LintIssue { message, line, is_error }`.
+
+Note: **bitwise operators (`&` `|` `~` `<<` `>>`) ARE supported in Enforce** — there is no
+bitwise lint.
+
+### 7. LSP Server (`src/lsp.rs`)
 - **Purpose**: Implements Language Server Protocol for editor integration
 - **Key Types**: `Backend`, `DocumentData`
 - **Functionality**:
@@ -76,36 +115,46 @@ enforce-script-lsp/
   - Real-time diagnostics with accurate position tracking
   - Completions for keywords and symbols
   - Hover information showing symbol types and definitions
-  - Go-to-definition navigation
-  - Find-references across the document
+  - Go-to-definition navigation (cross-file via the index)
+  - Find-references, scope-aware and cross-file (global / class member / local identity)
   - Signature help for functions/methods
   - Document symbols (hierarchical outline)
   - Folding ranges for classes
   - Stub implementations for: workspace-symbols, go-to-implementation, go-to-type-definition, code-actions, rename, inlay-hints
 
+## Data flow
+
+```
+initialize(rootUri, dependencyRoots, defaultDefines)
+  └─ Workspace::build(root, deps, default_defines)   → configs, prefix_map, compiled_dirs, dependency_roots
+initialized
+  └─ SymbolIndex::build(&workspace) → by_name, class_parents, by_usage, by_identity
+     (built on a blocking thread — async, the server stays responsive while it indexes)
+did_open(file)
+  └─ lex (with module defines) → parse → per-file semantic (with GlobalEnvironment) → lint
+```
+
 ## LSP Features
 
 ### Core Features (Implemented)
-- **Diagnostics** (`src/lsp.rs::analyze_document()`) - Real-time error and warning detection with accurate line/column positions
-- **Completion** (`src/lsp.rs::completion()`) - IntelliSense for classes, methods, variables, and Enforce Script keywords
-- **Hover Information** (`src/lsp.rs::get_hover()`) - Display symbol types, kinds, and definitions with Markdown formatting
-- **Go to Definition** (`src/lsp.rs::goto_definition()`) - Navigate to symbol definitions using symbol table lookups
-- **Find References** (`src/lsp.rs::references()`) - Find all occurrences of symbols in the current document
-- **Signature Help** (`src/lsp.rs::signature_help()`) - Basic parameter hints for functions and methods
-- **Document Symbols** (`src/lsp.rs::document_symbol()`) - Hierarchical outline view of classes, methods, enums, and fields
-- **Folding Ranges** (`src/lsp.rs::folding_range()`) - Support for collapsing/expanding classes
+- **Diagnostics** - Real-time error and warning detection with accurate line/column positions
+- **Completion** - IntelliSense for classes, methods, variables, and Enforce Script keywords;
+  `obj.`/`this.`/`super.` resolves the type and offers its members (fields/methods, incl. inherited)
+- **Hover Information** - Display symbol types, kinds, and definitions with Markdown formatting
+- **Go to Definition** - Navigate to symbol definitions using symbol table lookups (cross-file)
+- **Find References** - Find all usages of a symbol, scope-aware and cross-file (resolves a
+  global / class-member / local identity; member access resolves through the object's type)
+- **Signature Help** - Basic parameter hints for functions and methods
+- **Document Symbols** - Hierarchical outline view of classes, methods, enums, and fields
+- **Folding Ranges** - Support for collapsing/expanding classes
 
-### Core Features (Stub Implementations - Ready for Enhancement)
-- **Workspace Symbols** (`src/lsp.rs::symbol()`) - Search for symbols across all Enforce Script files in the project and in dependencies
-
-### Navigation Features (Stub Implementations - Ready for Enhancement)
-- **Go to Implementation** (`src/lsp.rs::goto_implementation()`) - Navigate to method implementations in derived classes
-- **Go to Type Definition** (`src/lsp.rs::goto_type_definition()`) - Jump to type definitions for variables and parameters
-
-### Editing Features (Stub Implementations - Ready for Enhancement)
-- **Code Actions** (`src/lsp.rs::code_action()`) - Quick fixes for common errors and refactoring suggestions
-- **Rename** (`src/lsp.rs::rename()`) - Rename symbols with automatic updates across all files
-- **Inlay Hints** (`src/lsp.rs::inlay_hint()`) - Display inferred types and parameter names inline
+### Stub Implementations (Ready for Enhancement)
+- **Workspace Symbols** - Search for symbols across all Enforce Script files
+- **Go to Implementation** - Navigate to method implementations in derived classes
+- **Go to Type Definition** - Jump to type definitions for variables and parameters
+- **Code Actions** - Quick fixes for common errors and refactoring suggestions
+- **Rename** - Rename symbols with automatic updates across all files
+- **Inlay Hints** - Display inferred types and parameter names inline
 
 ## Dependencies (`Cargo.toml`)
 
@@ -114,6 +163,7 @@ enforce-script-lsp/
 - **dashmap** 5.5 - Concurrent hash map for thread-safe document storage
 - **serde** 1.0 + **serde_json** - JSON serialization for LSP protocol
 - **regex** 1.10 - Pattern matching support
+- **url** 2 - URL encoding of indexed file paths (so they match the client's `Url` form)
 
 ## Enforce Script Syntax Reference
 
@@ -123,13 +173,7 @@ enforce-script-lsp/
 
 **Location**: Tests are co-located with modules using `#[cfg(test)]` sections
 
-**Current Test Coverage**: 102 tests total
-- `src/lexer.rs`: 38 tests covering tokenization of all language constructs
-- `src/parser.rs`: 34 tests covering parsing of classes, enums, and expressions
-- `src/semantic.rs`: 20 tests covering symbol resolution and error detection
-- `src/utils/position.rs`: 4 tests covering position and span operations
-- `src/utils/error.rs`: 2 tests covering error creation and display
-- `src/utils/diagnostics.rs`: 4 tests covering diagnostic generation
+**Current Test Coverage**: 178 tests total.
 
 **Running Tests**: 
 ```bash
@@ -165,6 +209,18 @@ RUST_LOG=debug cargo run
 cargo check
 ```
 
+## Conventions
+
+- **No `eprintln!` in parser/semantic error recovery.** On engine code the parser produces
+  thousands of recoverable errors; `eprintln!` floods stderr and **blocks** the pipe, hanging
+  indexing. Collect errors into `self.errors`, never print them.
+- `Symbol` carries `parent: Option<String>`: `None` = global, `Some(class)` = member. The
+  `environment()` split relies on this.
+- Config is read from `initializationOptions` in `initialize` (`dependencyRoots`, `defaultDefines`,
+  `lenientMemberScope`).
+- The parser is validated against real-world DayZ codebases; new syntax must not regress
+  `cargo test` nor re-introduce parse errors on real code.
+
 ## Architecture Notes
 
 - **Lexer → Parser → Semantic → LSP**: Pipeline architecture with clear separation of concerns
@@ -183,16 +239,15 @@ cargo check
 - All utility functions are documented
 
 ### Maintainability
-- Code is organized into focused modules (lexer, parser, semantic, lsp, utils)
+- Code is organized into focused modules (lexer, parser, semantic, workspace, index, lint, lsp, utils)
 - Common utilities extracted into reusable components
 - Consistent error handling with custom error types
 - Position tracking throughout the pipeline for accurate diagnostics
 
 ### Test Quality
-- 102 comprehensive tests with descriptive names
+- 178 comprehensive tests with descriptive names
 - Tests cover all major features and edge cases
 - Both success and failure scenarios tested
-- Test coverage exceeds 80% of codebase
 
 ### Best Practices
 - Follows Rust idioms and conventions
@@ -200,6 +255,13 @@ cargo check
 - Efficient data structures (HashMap, DashMap)
 - Proper separation of concerns
 
+## Operational notes
+
+- **After deploying the binary (`cp … .new && mv`), restart the running server process.** `mv`
+  swaps the path to a new inode, but an already-running process keeps the old inode in memory.
+  `pkill -f 'enforce-script-lsp --stdio'` — the editor relaunches it lazily. Verify with
+  `ls -li /proc/<PID>/exe`: a `(deleted)` suffix means stale.
+
 ## Notes
 
-You must update the agents.md, readme.md, and tutorial.md files to reflect any changes made to the implementation or architecture.
+You must update the `AGENTS.md` and `README.md` files to reflect any changes made to the implementation or architecture.
