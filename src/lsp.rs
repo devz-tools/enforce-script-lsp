@@ -1045,9 +1045,14 @@ fn visit_expr_member<'a>(
         Expression::MemberAccess {
             object, member, span, ..
         } => {
-            // The deepest MemberAccess containing the cursor is the one whose
-            // member the cursor is on; a deeper one overrides a shallower one.
-            if span_contains(span, line, column) {
+            // The cursor must be on the member (the trailing identifier), not the
+            // object; a deeper MemberAccess whose member is under the cursor
+            // overrides a shallower one.
+            let member_start_col = span.end.column.saturating_sub(member.chars().count());
+            if span_contains(span, line, column)
+                && line == span.end.line
+                && column >= member_start_col
+            {
                 *found = Some((object, member));
             }
             visit_expr_member(object, line, column, found);

@@ -1781,7 +1781,14 @@ impl Parser {
                     String::new()
                 };
                 let start = expr.span().start.clone();
-                let end = Position::from_token(self.previous().unwrap());
+                // Span must cover the member too (not just up to its start), so
+                // go-to-definition/hover can resolve `obj.member` at the member.
+                let prev = self.previous().unwrap();
+                let end = Position::new(
+                    prev.line,
+                    prev.column + prev.lexeme.chars().count(),
+                    prev.offset + prev.lexeme.chars().count(),
+                );
                 let mut result = Expression::MemberAccess {
                     object: Box::new(expr),
                     member,
