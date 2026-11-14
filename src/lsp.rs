@@ -12,7 +12,9 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use crate::lexer::Lexer;
 use crate::index::{IndexedSymbol, IndexedUsage, SymbolIndex, UsageRole};
 use crate::lint::{lint, LintConfig, LintIssue};
-use crate::parser::{type_ref_base_name, Class, Declaration, Parser, Program, Span};
+use crate::parser::{
+    type_ref_base_name, Class, Declaration, Expression, Parser, Program, Span, Statement,
+};
 use crate::semantic::{SemanticAnalyzer, Symbol, SymbolKind, SymbolTable};
 use crate::workspace::Workspace;
 
@@ -410,7 +412,10 @@ impl Backend {
     /// Member access completion: `obj.` resolves `obj`'s type and offers its
     /// fields/methods (including inherited), instead of returning everything.
     fn member_completions(&self, doc: &DocumentData, position: Position) -> Vec<CompletionItem> {
-        let Some((object, partial)) = find_member_context(&doc.text, position) else {
+        let Some(program) = doc.program.as_ref() else {
+            return Vec::new();
+        };
+        let Some((object_expr, partial)) = find_member_access_at(program, position) else {
             return Vec::new();
         };
 
@@ -419,29 +424,13 @@ impl Backend {
             return Vec::new();
         };
 
-        // Resolve the object's type name.
-        let type_name = if object == "this" || object == "super" {
-            let enclosing = doc
-                .program
-                .as_ref()
-                .and_then(|p| enclosing_class(p, position));
-            match (object.as_str(), enclosing) {
-                ("super", Some(class)) => index.class_parents.get(&class).cloned().flatten(),
-                (_, Some(class)) => Some(class),
-                _ => None,
-            }
-        } else {
-            let enclosing = doc
-                .program
-                .as_ref()
-                .and_then(|p| enclosing_class(p, position));
-            resolve_type_name(&object, doc, index, enclosing.as_deref())
-        };
-        let Some(type_name) = type_name else {
+        // Resolve the object expression's type (handles `obj.method().` chains).
+        let enclosing = enclosing_class(program, position);
+        let Some(type_name) = resolve_expr_type(object_expr, doc, index, enclosing.as_deref()) else {
             return Vec::new();
         };
 
-        collect_members(&type_name, index, doc, &partial)
+        collect_members(&type_name, index, doc, partial)
     }
 
     fn get_hover(&self, uri: &str, position: Position) -> Option<Hover> {
@@ -451,32 +440,20 @@ impl Backend {
         let lenient = self.lenient_member_scope.load(Ordering::Relaxed);
 
         // 1. Member access (`obj.name`): resolve via the OBJECT's type.
-        if let Some((object, _partial)) = find_member_context(&doc.text, position) {
+        if let Some(program) = doc.program.as_ref()
+            && let Some((object_expr, member)) = find_member_access_at(program, position)
+        {
             if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
-                let type_name = if object == "this" || object == "super" {
-                    let enclosing = doc
-                        .program
-                        .as_ref()
-                        .and_then(|p| enclosing_class(p, position));
-                    match (object.as_str(), enclosing) {
-                        ("super", Some(c)) => index.class_parents.get(&c).cloned().flatten(),
-                        (_, Some(c)) => Some(c),
-                        _ => None,
-                    }
-                } else {
-                    let enclosing = doc
-                        .program
-                        .as_ref()
-                        .and_then(|p| enclosing_class(p, position));
-                    resolve_type_name(&object, &doc, index, enclosing.as_deref())
-                };
-                if let Some(type_name) = type_name {
+                let enclosing = enclosing_class(program, position);
+                if let Some(type_name) =
+                    resolve_expr_type(object_expr, &doc, index, enclosing.as_deref())
+                {
                     if let Some(symbol_table) = doc.symbol_table.as_ref()
-                        && let Some(symbol) = symbol_table.lookup_in_class(&type_name, &symbol_name)
+                        && let Some(symbol) = symbol_table.lookup_in_class(&type_name, member)
                     {
                         return Some(symbol_to_hover(symbol));
                     }
-                    if let Some(occ) = find_member_in_hierarchy(&type_name, &symbol_name, index) {
+                    if let Some(occ) = find_member_in_hierarchy(&type_name, member, index) {
                         return Some(symbol_to_hover(&occ.symbol));
                     }
                 }
@@ -933,6 +910,190 @@ fn enclosing_method(program: &Program, position: Position) -> Option<Span> {
     None
 }
 
+/// Find the `MemberAccess` expression under `position`, returning its object
+/// expression and member name. Handles chained calls like `obj.method().member`
+/// (the object is the full sub-expression, not just a trailing identifier).
+fn find_member_access_at<'a>(
+    program: &'a Program,
+    position: Position,
+) -> Option<(&'a Expression, &'a str)> {
+    let line = position.line as usize + 1;
+    let column = position.character as usize + 1;
+    let mut found = None;
+    for decl in &program.declarations {
+        visit_decl_member(decl, line, column, &mut found);
+    }
+    found
+}
+
+fn visit_decl_member<'a>(
+    decl: &'a Declaration,
+    line: usize,
+    column: usize,
+    found: &mut Option<(&'a Expression, &'a str)>,
+) {
+    match decl {
+        Declaration::Class(class) => {
+            for method in &class.methods {
+                if let Some(body) = &method.body {
+                    visit_stmt_member(body, line, column, found);
+                }
+            }
+        }
+        Declaration::Function(method) => {
+            if let Some(body) = &method.body {
+                visit_stmt_member(body, line, column, found);
+            }
+        }
+        Declaration::Variable(field) => {
+            if let Some(init) = &field.initializer {
+                visit_expr_member(init, line, column, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn visit_stmt_member<'a>(
+    stmt: &'a Statement,
+    line: usize,
+    column: usize,
+    found: &mut Option<(&'a Expression, &'a str)>,
+) {
+    match stmt {
+        Statement::VariableDeclaration { declarators, .. } => {
+            for (_, init) in declarators {
+                if let Some(e) = init {
+                    visit_expr_member(e, line, column, found);
+                }
+            }
+        }
+        Statement::Expression { expression, .. } => visit_expr_member(expression, line, column, found),
+        Statement::Block { statements, .. } => {
+            for s in statements {
+                visit_stmt_member(s, line, column, found);
+            }
+        }
+        Statement::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            visit_expr_member(condition, line, column, found);
+            visit_stmt_member(then_branch, line, column, found);
+            if let Some(e) = else_branch {
+                visit_stmt_member(e, line, column, found);
+            }
+        }
+        Statement::Switch {
+            expression, cases, ..
+        } => {
+            visit_expr_member(expression, line, column, found);
+            for (case_expr, case_stmts) in cases {
+                if let Some(e) = case_expr {
+                    visit_expr_member(e, line, column, found);
+                }
+                for s in case_stmts {
+                    visit_stmt_member(s, line, column, found);
+                }
+            }
+        }
+        Statement::For {
+            initializer,
+            condition,
+            increment,
+            body,
+            ..
+        } => {
+            if let Some(i) = initializer {
+                visit_stmt_member(i, line, column, found);
+            }
+            if let Some(c) = condition {
+                visit_expr_member(c, line, column, found);
+            }
+            if let Some(inc) = increment {
+                visit_expr_member(inc, line, column, found);
+            }
+            visit_stmt_member(body, line, column, found);
+        }
+        Statement::Foreach { iterable, body, .. } => {
+            visit_expr_member(iterable, line, column, found);
+            visit_stmt_member(body, line, column, found);
+        }
+        Statement::While { condition, body, .. } => {
+            visit_expr_member(condition, line, column, found);
+            visit_stmt_member(body, line, column, found);
+        }
+        Statement::Return { value, .. } => {
+            if let Some(e) = value {
+                visit_expr_member(e, line, column, found);
+            }
+        }
+        Statement::Delete { expression, .. } => visit_expr_member(expression, line, column, found),
+        Statement::Break(_) | Statement::Continue(_) => {}
+    }
+}
+
+fn visit_expr_member<'a>(
+    expr: &'a Expression,
+    line: usize,
+    column: usize,
+    found: &mut Option<(&'a Expression, &'a str)>,
+) {
+    match expr {
+        Expression::MemberAccess {
+            object, member, span, ..
+        } => {
+            // The deepest MemberAccess containing the cursor is the one whose
+            // member the cursor is on; a deeper one overrides a shallower one.
+            if span_contains(span, line, column) {
+                *found = Some((object, member));
+            }
+            visit_expr_member(object, line, column, found);
+        }
+        Expression::Call {
+            callee, arguments, ..
+        } => {
+            visit_expr_member(callee, line, column, found);
+            for a in arguments {
+                visit_expr_member(a, line, column, found);
+            }
+        }
+        Expression::Binary { left, right, .. } => {
+            visit_expr_member(left, line, column, found);
+            visit_expr_member(right, line, column, found);
+        }
+        Expression::Unary { operand, .. } => visit_expr_member(operand, line, column, found),
+        Expression::Index { object, index, .. } => {
+            visit_expr_member(object, line, column, found);
+            visit_expr_member(index, line, column, found);
+        }
+        Expression::ArrayLiteral { elements, .. } => {
+            for e in elements {
+                visit_expr_member(e, line, column, found);
+            }
+        }
+        Expression::New { arguments, .. } => {
+            for a in arguments {
+                visit_expr_member(a, line, column, found);
+            }
+        }
+        Expression::Cast { expression, .. } => visit_expr_member(expression, line, column, found),
+        Expression::Ternary {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            visit_expr_member(condition, line, column, found);
+            visit_expr_member(then_expr, line, column, found);
+            visit_expr_member(else_expr, line, column, found);
+        }
+        _ => {}
+    }
+}
+
 /// Whether `name` is a known class type (has a parent entry or a Class symbol).
 fn is_class_type(name: &str, index: &SymbolIndex) -> bool {
     if index.class_parents.contains_key(name) {
@@ -1003,6 +1164,33 @@ fn resolve_type_name(
     }
 
     None
+}
+
+/// Resolve the type name of an arbitrary expression (identifier, member access,
+/// call, cast, `this`/`super`). Powers `obj.method().member` by resolving the
+/// object's type recursively through method calls and member accesses.
+fn resolve_expr_type(
+    expr: &Expression,
+    doc: &DocumentData,
+    index: &SymbolIndex,
+    enclosing: Option<&str>,
+) -> Option<String> {
+    match expr {
+        Expression::Identifier(name, _) => resolve_type_name(name, doc, index, enclosing),
+        Expression::This(_) => enclosing.map(str::to_string),
+        Expression::Super(_) => enclosing.and_then(|c| index.class_parents.get(c).cloned().flatten()),
+        Expression::MemberAccess { object, member, .. } => {
+            let obj_type = resolve_expr_type(object, doc, index, enclosing)?;
+            let occ = find_member_in_hierarchy(&obj_type, member, index)?;
+            occ.symbol.type_ref.as_ref().map(type_ref_base_name)
+        }
+        Expression::Call { callee, .. } => resolve_expr_type(callee, doc, index, enclosing),
+        Expression::Cast { type_ref, .. } | Expression::New { type_ref, .. } => {
+            Some(type_ref_base_name(type_ref))
+        }
+        Expression::TypeRef(t, _) => Some(type_ref_base_name(t)),
+        _ => None,
+    }
 }
 
 /// Build the inheritance chain `[class, parent, grandparent, …]`, guarding
@@ -1388,35 +1576,23 @@ impl LanguageServer for Backend {
 
         // 1. Member access (`obj.name`): resolve the member via the OBJECT's type
         //    (not the enclosing class), including inherited members.
-        if let Some((object, _partial)) = find_member_context(&doc.text, position) {
+        if let Some(program) = doc.program.as_ref()
+            && let Some((object_expr, member)) = find_member_access_at(program, position)
+        {
             if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
-                let type_name = if object == "this" || object == "super" {
-                    let enclosing = doc
-                        .program
-                        .as_ref()
-                        .and_then(|p| enclosing_class(p, position));
-                    match (object.as_str(), enclosing) {
-                        ("super", Some(c)) => index.class_parents.get(&c).cloned().flatten(),
-                        (_, Some(c)) => Some(c),
-                        _ => None,
-                    }
-                } else {
-                    let enclosing = doc
-                        .program
-                        .as_ref()
-                        .and_then(|p| enclosing_class(p, position));
-                    resolve_type_name(&object, &doc, index, enclosing.as_deref())
-                };
-                if let Some(type_name) = type_name {
+                let enclosing = enclosing_class(program, position);
+                if let Some(type_name) =
+                    resolve_expr_type(object_expr, &doc, index, enclosing.as_deref())
+                {
                     if let Some(symbol_table) = doc.symbol_table.as_ref()
-                        && let Some(symbol) = symbol_table.lookup_in_class(&type_name, &symbol_name)
+                        && let Some(symbol) = symbol_table.lookup_in_class(&type_name, member)
                     {
                         return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                             uri: uri.clone(),
                             range: span_to_range(&symbol.span),
                         })));
                     }
-                    if let Some(occ) = find_member_in_hierarchy(&type_name, &symbol_name, index)
+                    if let Some(occ) = find_member_in_hierarchy(&type_name, member, index)
                         && let Ok(url) = Url::parse(&occ.uri)
                     {
                         return Ok(Some(GotoDefinitionResponse::Scalar(Location {
