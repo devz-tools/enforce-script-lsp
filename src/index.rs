@@ -3,7 +3,8 @@ use std::path::Path;
 
 use crate::lexer::Lexer;
 use crate::parser::{
-    type_ref_base_name, Declaration, Expression, Parser, Program, Span, Statement, TypeRef,
+    literal_value, type_ref_base_name, Declaration, Expression, Parser, Program, Span, Statement,
+    TypeRef,
 };
 use crate::semantic::{GlobalEnvironment, Symbol, SymbolKind};
 use crate::workspace::Workspace;
@@ -399,6 +400,7 @@ fn index_program(program: &Program, uri: &str, index: &mut SymbolIndex) {
                         scope: 0,
                         modifiers: class.modifiers.clone(),
                         parent: None,
+                        value: None,
                     },
                 );
                 for field in &class.fields {
@@ -412,6 +414,7 @@ fn index_program(program: &Program, uri: &str, index: &mut SymbolIndex) {
                             scope: 0,
                             modifiers: field.modifiers.clone(),
                             parent: Some(class.name.clone()),
+                            value: field.initializer.as_ref().and_then(literal_value),
                         },
                     );
                 }
@@ -426,6 +429,7 @@ fn index_program(program: &Program, uri: &str, index: &mut SymbolIndex) {
                             scope: 0,
                             modifiers: method.modifiers.clone(),
                             parent: Some(class.name.clone()),
+                            value: None,
                         },
                     );
                 }
@@ -441,6 +445,7 @@ fn index_program(program: &Program, uri: &str, index: &mut SymbolIndex) {
                         scope: 0,
                         modifiers: Vec::new(),
                         parent: None,
+                        value: None,
                     },
                 );
                 for variant in &enum_decl.variants {
@@ -454,6 +459,7 @@ fn index_program(program: &Program, uri: &str, index: &mut SymbolIndex) {
                             scope: 0,
                             modifiers: Vec::new(),
                             parent: Some(enum_decl.name.clone()),
+                            value: None,
                         },
                     );
                     // DayZ also exposes each variant as a C++-style global
@@ -468,6 +474,7 @@ fn index_program(program: &Program, uri: &str, index: &mut SymbolIndex) {
                             scope: 0,
                             modifiers: Vec::new(),
                             parent: None,
+                            value: None,
                         },
                     );
                 }
@@ -493,6 +500,7 @@ fn index_program(program: &Program, uri: &str, index: &mut SymbolIndex) {
                         scope: 0,
                         modifiers: Vec::new(),
                         parent: None,
+                        value: None,
                     },
                 );
             }
@@ -507,6 +515,7 @@ fn index_program(program: &Program, uri: &str, index: &mut SymbolIndex) {
                         scope: 0,
                         modifiers: method.modifiers.clone(),
                         parent: None,
+                        value: None,
                     },
                 );
             }
@@ -521,6 +530,7 @@ fn index_program(program: &Program, uri: &str, index: &mut SymbolIndex) {
                         scope: 0,
                         modifiers: field.modifiers.clone(),
                         parent: None,
+                        value: field.initializer.as_ref().and_then(literal_value),
                     },
                 );
             }

@@ -662,10 +662,18 @@ fn symbol_to_hover(symbol: &crate::semantic::Symbol) -> Hover {
         Some(t) => format!("{:?}", t),
         None => "unknown".to_string(),
     };
-    let value = format!(
-        "```enforcescript\n({}) {}: {}\n```",
-        kind_str, symbol.name, type_str
-    );
+    // Show the literal value of a constant/field initializer (`= 50.0`) inline,
+    // so it's visible without jumping to the definition.
+    let value = match &symbol.value {
+        Some(v) => format!(
+            "```enforcescript\n({}) {}: {} = {}\n```",
+            kind_str, symbol.name, type_str, v
+        ),
+        None => format!(
+            "```enforcescript\n({}) {}: {}\n```",
+            kind_str, symbol.name, type_str
+        ),
+    };
     Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -1970,6 +1978,7 @@ mod tests {
                     scope: 0,
                     modifiers: Vec::new(),
                     parent: Some("Base".to_string()),
+                    value: None,
                 },
             }],
         );
@@ -1993,6 +2002,7 @@ mod tests {
             scope: 0,
             modifiers: Vec::new(),
             parent: parent.map(|s| s.to_string()),
+            value: None,
         };
 
         // A field/method of the current class → a class member.

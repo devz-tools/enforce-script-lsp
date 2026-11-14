@@ -133,6 +133,9 @@ pub struct Symbol {
     pub scope: usize,
     pub modifiers: Vec<String>,
     pub parent: Option<String>, // Parent class/enum name
+    /// Literal value of a constant/field initializer (e.g. `= 50.0`), shown in
+    /// hover. `None` for complex or absent initializers.
+    pub value: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +389,7 @@ impl SemanticAnalyzer {
             scope: 0, // Classes are always in global scope
             modifiers: class.modifiers.clone(),
             parent: None,
+            value: None,
         };
 
         if let Err(e) = self.symbol_table.define(symbol) {
@@ -412,6 +416,7 @@ impl SemanticAnalyzer {
             scope: 0,
             modifiers: Vec::new(),
             parent: None,
+            value: None,
         };
 
         if let Err(e) = self.symbol_table.define(symbol) {
@@ -428,6 +433,7 @@ impl SemanticAnalyzer {
                 scope: 0,
                 modifiers: Vec::new(),
                 parent: Some(enum_decl.name.clone()),
+                value: None,
             };
 
             if let Err(e) = self.symbol_table.define(variant_symbol) {
@@ -447,6 +453,7 @@ impl SemanticAnalyzer {
             scope: 0,
             modifiers: Vec::new(),
             parent: None,
+            value: None,
         };
 
         if let Err(e) = self.symbol_table.define(symbol) {
@@ -465,6 +472,7 @@ impl SemanticAnalyzer {
             scope: 0,
             modifiers: field.modifiers.clone(),
             parent: None,
+            value: field.initializer.as_ref().and_then(literal_value),
         };
 
         if let Err(e) = self.symbol_table.define(symbol) {
@@ -490,6 +498,7 @@ impl SemanticAnalyzer {
                 scope: 0,
                 modifiers: field.modifiers.clone(),
                 parent: Some(class.name.clone()),
+                value: field.initializer.as_ref().and_then(literal_value),
             };
 
             if let Err(e) = self.symbol_table.define(symbol) {
@@ -537,6 +546,7 @@ impl SemanticAnalyzer {
             scope: 0,
             modifiers: method.modifiers.clone(),
             parent: class_name.clone(),
+            value: None,
         };
 
         if let Err(e) = self.symbol_table.define(symbol) {
@@ -566,6 +576,7 @@ impl SemanticAnalyzer {
                 scope: self.symbol_table.current_scope,
                 modifiers: param.modifiers.clone(),
                 parent: class_name.clone(),
+                value: None,
             };
 
             if let Err(e) = self.symbol_table.define(param_symbol) {
@@ -601,6 +612,7 @@ impl SemanticAnalyzer {
                         scope: self.symbol_table.current_scope,
                         modifiers: modifiers.clone(),
                         parent: self.symbol_table.current_class.clone(),
+                        value: initializer.as_ref().and_then(literal_value),
                     };
 
                     if let Err(e) = self.symbol_table.define(symbol) {
@@ -684,6 +696,7 @@ impl SemanticAnalyzer {
                         scope: self.symbol_table.current_scope,
                         modifiers: Vec::new(),
                         parent: self.symbol_table.current_class.clone(),
+                        value: None,
                     };
                     if let Err(e) = self.symbol_table.define(key_symbol) {
                         self.errors.push(e);
@@ -699,6 +712,7 @@ impl SemanticAnalyzer {
                     scope: self.symbol_table.current_scope,
                     modifiers: Vec::new(),
                     parent: self.symbol_table.current_class.clone(),
+                    value: None,
                 };
                 if let Err(e) = self.symbol_table.define(value_symbol) {
                     self.errors.push(e);

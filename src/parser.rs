@@ -67,6 +67,20 @@ pub fn type_ref_base_name(t: &TypeRef) -> String {
     }
 }
 
+/// A human-readable value of a literal initializer (`50.0`, `5`, `"x"`, `true`).
+/// `None` for complex expressions or non-literals.
+pub fn literal_value(expr: &Expression) -> Option<String> {
+    match expr {
+        // Preserve the ".0" of an integral float literal (`50.0` → "50.0", not "50").
+        Expression::FloatLiteral(f, _) if f.fract() == 0.0 => Some(format!("{:.1}", f)),
+        Expression::FloatLiteral(f, _) => Some(f.to_string()),
+        Expression::IntLiteral(i, _) => Some(i.to_string()),
+        Expression::StringLiteral(s, _) => Some(s.clone()),
+        Expression::BoolLiteral(b, _) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
 /// Whether a token can begin an expression (a value), as opposed to an operator
 /// or delimiter. Used to disambiguate `(ClassName)expr` casts from parenthesized
 /// expressions like `(value) & 255`.
