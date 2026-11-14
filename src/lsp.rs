@@ -445,9 +445,20 @@ impl Backend {
         {
             if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
                 let enclosing = enclosing_class(program, position);
+                let is_super = matches!(object_expr, Expression::Super(_));
                 if let Some(type_name) =
                     resolve_expr_type(object_expr, &doc, index, enclosing.as_deref())
                 {
+                    // `super.Member` resolves to the origin/parent declaration, not
+                    // the modded override in the current file.
+                    if is_super {
+                        if let Some(occ) =
+                            find_member_in_hierarchy_skip_uri(&type_name, member, index, uri)
+                        {
+                            return Some(symbol_to_hover(&occ.symbol));
+                        }
+                        return None;
+                    }
                     if let Some(symbol_table) = doc.symbol_table.as_ref()
                         && let Some(symbol) = symbol_table.lookup_in_class(&type_name, member)
                     {
@@ -456,6 +467,23 @@ impl Backend {
                     if let Some(occ) = find_member_in_hierarchy(&type_name, member, index) {
                         return Some(symbol_to_hover(&occ.symbol));
                     }
+                }
+            }
+            return None;
+        }
+
+        // 1.5. Cursor on a `modded class X` declaration name: hover the origin.
+        if let Some(program) = doc.program.as_ref()
+            && let Some(name) = class_name_at(program, position, &symbol_name)
+            && is_modded_class_doc(&name, &doc)
+        {
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+                let best = index
+                    .lookup(&name)
+                    .iter()
+                    .find(|m| m.symbol.kind == SymbolKind::Class && !is_modded(&m.symbol));
+                if let Some(m) = best {
+                    return Some(symbol_to_hover(&m.symbol));
                 }
             }
             return None;
@@ -1191,7 +1219,15 @@ fn resolve_expr_type(
     match expr {
         Expression::Identifier(name, _) => resolve_type_name(name, doc, index, enclosing),
         Expression::This(_) => enclosing.map(str::to_string),
-        Expression::Super(_) => enclosing.and_then(|c| index.class_parents.get(c).cloned().flatten()),
+        Expression::Super(_) => {
+            // In a `modded class X`, `super` refers to the origin `class X` (which
+            // the modded declaration merges with); in a plain class it's the parent.
+            if enclosing.is_some_and(|c| is_modded_class_doc(c, doc)) {
+                enclosing.map(str::to_string)
+            } else {
+                enclosing.and_then(|c| index.class_parents.get(c).cloned().flatten())
+            }
+        }
         Expression::MemberAccess { object, member, .. } => {
             let obj_type = resolve_expr_type(object, doc, index, enclosing)?;
             let occ = find_member_in_hierarchy(&obj_type, member, index)?;
@@ -1228,6 +1264,45 @@ fn ancestry_chain(class: &str, index: &SymbolIndex) -> Vec<String> {
 fn is_class_member_of(symbol: &Symbol, class: &str) -> bool {
     matches!(symbol.kind, SymbolKind::Field | SymbolKind::Method)
         && symbol.parent.as_deref() == Some(class)
+}
+
+/// Whether a class symbol is a `modded class` declaration (CF/Expansion-style
+/// class extension that merges with its origin class of the same name).
+fn is_modded(symbol: &Symbol) -> bool {
+    symbol.modifiers.iter().any(|m| m == "modded")
+}
+
+/// Whether the current document declares `modded class <name>`.
+fn is_modded_class_doc(name: &str, doc: &DocumentData) -> bool {
+    doc.program.as_ref().is_some_and(|p| {
+        p.declarations.iter().any(|d| {
+            matches!(
+                d,
+                Declaration::Class(c)
+                    if c.name == name && c.modifiers.iter().any(|m| m == "modded")
+            )
+        })
+    })
+}
+
+/// If `position` is on the name of a class declaration (the `class`/`modded
+/// class` keyword line) and `symbol_name` equals that class's name, return the
+/// class name. Lets goto-def/hover on `modded class X` resolve to the origin
+/// `class X` instead of the same-named constructor.
+fn class_name_at(program: &Program, position: Position, symbol_name: &str) -> Option<String> {
+    let line = position.line as usize + 1;
+    let column = position.character as usize + 1;
+    for decl in &program.declarations {
+        if let Declaration::Class(class) = decl {
+            if class.span.start.line == line
+                && class.name == symbol_name
+                && span_contains(&class.span, line, column)
+            {
+                return Some(class.name.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Build a completion item for a member. Enum variants are indexed with a
@@ -1316,6 +1391,48 @@ fn find_member_in_hierarchy<'a>(
         .iter()
         .find(|occ| occ.symbol.parent.as_ref().is_some_and(|p| chain.contains(p)))
         .or_else(|| index.lookup(&format!("{}.{}", class, name)).first())
+}
+
+/// Whether two URIs refer to the same file, ignoring normalization differences
+/// (e.g. `file:///a/b` vs `file:///a/b/` or percent-encoding). Raw-string equal
+/// is the fast path; otherwise compare resolved filesystem paths.
+fn same_file(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (Url::parse(a), Url::parse(b)) {
+        (Ok(ua), Ok(ub)) => match (ua.to_file_path(), ub.to_file_path()) {
+            (Ok(pa), Ok(pb)) => pa == pb,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Like `find_member_in_hierarchy`, but skips occurrences from `skip_uri`. Used
+/// for `super.Member`: in a `modded class X`, `super` resolves to the origin
+/// `class X`, so the member must be found in the origin (or an ancestor), not
+/// the modded override living in the current file.
+fn find_member_in_hierarchy_skip_uri<'a>(
+    class: &str,
+    name: &str,
+    index: &'a SymbolIndex,
+    skip_uri: &str,
+) -> Option<&'a IndexedSymbol> {
+    let chain = ancestry_chain(class, index);
+    index
+        .lookup(name)
+        .iter()
+        .find(|occ| {
+            !same_file(&occ.uri, skip_uri)
+                && occ.symbol.parent.as_ref().is_some_and(|p| chain.contains(p))
+        })
+        .or_else(|| {
+            index
+                .lookup(&format!("{}.{}", class, name))
+                .iter()
+                .find(|occ| !same_file(&occ.uri, skip_uri))
+        })
 }
 
 #[tower_lsp::async_trait]
@@ -1594,9 +1711,24 @@ impl LanguageServer for Backend {
         {
             if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
                 let enclosing = enclosing_class(program, position);
+                let is_super = matches!(object_expr, Expression::Super(_));
                 if let Some(type_name) =
                     resolve_expr_type(object_expr, &doc, index, enclosing.as_deref())
                 {
+                    // `super.Member` resolves to the origin/parent declaration, not
+                    // the modded override living in the current file.
+                    if is_super {
+                        if let Some(occ) =
+                            find_member_in_hierarchy_skip_uri(&type_name, member, index, &uri_str)
+                            && let Ok(url) = Url::parse(&occ.uri)
+                        {
+                            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                                uri: url,
+                                range: span_to_range(&occ.symbol.span),
+                            })));
+                        }
+                        return Ok(None);
+                    }
                     if let Some(symbol_table) = doc.symbol_table.as_ref()
                         && let Some(symbol) = symbol_table.lookup_in_class(&type_name, member)
                     {
@@ -1617,6 +1749,30 @@ impl LanguageServer for Backend {
             }
             // A member access we couldn't resolve — don't fall through to a
             // same-named global or unrelated member.
+            return Ok(None);
+        }
+
+        // 1.5. Cursor on a `modded class X` declaration name: resolve to the
+        //      origin (non-modded) `class X` instead of the same-named constructor.
+        if let Some(program) = doc.program.as_ref()
+            && let Some(name) = class_name_at(program, position, &symbol_name)
+            && is_modded_class_doc(&name, &doc)
+        {
+            if let Some(index) = self.symbol_index.read().unwrap().as_ref() {
+                let best = index
+                    .lookup(&name)
+                    .iter()
+                    .find(|m| m.symbol.kind == SymbolKind::Class && !is_modded(&m.symbol));
+                if let Some(m) = best
+                    && let Ok(url) = Url::parse(&m.uri)
+                {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: url,
+                        range: span_to_range(&m.symbol.span),
+                    })));
+                }
+            }
+            // No origin indexed yet — don't fall through to the constructor.
             return Ok(None);
         }
 
