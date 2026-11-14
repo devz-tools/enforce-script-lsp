@@ -847,6 +847,9 @@ impl Parser {
         let type_ref = self.parse_type()?;
         let name = self.consume_identifier("Expected function or variable name")?;
 
+        // Array variable: `const string X[1] = ...` (the `[N]` follows the name).
+        self.consume_array_brackets()?;
+
         // A following '(' marks a function; otherwise it's a module-level variable
         // (e.g. `static const string DM_BOTORAMA_VERSION = "3.521";`).
         if self.check(&TokenType::LeftParen) {
